@@ -1277,6 +1277,26 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     sched_need_reserve = true;
 }
 
+void llama_context::set_seq_adapters(llama_adapter_lora ** adapters, size_t n_adapters) {
+    // P2 fork: register the ordered adapter pool for mixed-batch routing.
+    seq_loras.assign(adapters, adapters + n_adapters);
+    if (seq_adapter_map.empty()) {
+        seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
+    }
+    sched_need_reserve = true;
+}
+
+void llama_context::set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx) {
+    if (seq_adapter_map.empty()) {
+        seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_adapter_map.size()) {
+        LLAMA_LOG_ERROR("%s: seq_id %d out of range [0, %zu)\n", __func__, seq_id, seq_adapter_map.size());
+        return;
+    }
+    seq_adapter_map[seq_id] = adapter_idx;
+}
+
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -2444,6 +2464,8 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.seq_loras       =*/ &seq_loras,
+        /*.seq_adapter_map =*/ seq_adapter_map.data(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
@@ -3851,6 +3873,28 @@ int32_t llama_set_adapters_lora(
     }
 
     ctx->set_adapters_lora(adapters, n_adapters, scales);
+
+    return 0;
+}
+
+int32_t llama_set_seq_adapters(
+            llama_context * ctx,
+            llama_adapter_lora ** adapters,
+            size_t n_adapters) {
+    if (adapters == nullptr) {
+        GGML_ASSERT(n_adapters == 0 && "invalid llama_set_seq_adapters call");
+    }
+
+    ctx->set_seq_adapters(adapters, n_adapters);
+
+    return 0;
+}
+
+int32_t llama_set_seq_adapter(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t adapter_idx) {
+    ctx->set_seq_adapter(seq_id, adapter_idx);
 
     return 0;
 }

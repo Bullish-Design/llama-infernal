@@ -696,6 +696,10 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // Fork hats: number of depth-loop passes for looped archs (nanbeige); 1
+    // for every non-looped arch. Sizes the context-level loop_hat_map.
+    virtual int32_t loop_count() const { return 1; }
+
 protected:
     llama_model_params params;
 

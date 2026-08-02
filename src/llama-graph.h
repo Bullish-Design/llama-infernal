@@ -746,6 +746,8 @@ struct llm_graph_params {
     // per-sequence (mixed-batch) LoRA routing: ordered adapter pool + seq->idx map
     const std::vector<llama_adapter_lora *> * seq_loras;
     const int32_t                           * seq_adapter_map;
+    // fork hats: per-loop-step LoRA routing (looped archs); null unless set
+    const std::vector<int32_t>              * loop_hat_map;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -990,6 +992,10 @@ struct llm_graph_context {
     const std::vector<llama_adapter_lora *> * seq_loras        = nullptr;
     const int32_t                           * seq_adapter_map  = nullptr;
     mutable ggml_tensor                     * seq_lora_mask    = nullptr; // F32 [n_tokens, n_adapters], built lazily
+    // fork hats: per-loop-step LoRA routing; loop_n_phys is set by looped arch
+    // graphs (nanbeige) so build_lora_mm can compute loop_step = il / n_phys
+    const std::vector<int32_t>              * loop_hat_map     = nullptr;
+    int32_t                                   loop_n_phys      = 0;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -1019,7 +1025,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+                    int   il = -1) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(

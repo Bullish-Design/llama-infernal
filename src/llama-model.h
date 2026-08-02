@@ -723,6 +723,10 @@ struct llama_model_base : public llama_model {
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
 
+    // Fork hats: number of depth-loop passes for looped archs (nanbeige);
+    // 1 for every non-looped arch. Used to size the context-level loop_hat_map.
+    virtual int32_t loop_count() const { return 1; }
+
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     // convenience overload of create_tensor that doesn't require llama_model_loader

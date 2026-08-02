@@ -87,6 +87,11 @@ llama_model_nanbeige::graph::graph(const llama_model & model, const llm_graph_pa
     const int n_phys  = nb.n_layer_phys > 0 ? nb.n_layer_phys : (int) n_layer;
     const int n_loops = nb.n_loops > 0 ? nb.n_loops : 1;
 
+    // Fork hats: build_lora_mm computes loop_step = il / loop_n_phys (a
+    // graph-build-time constant, PORT-PLAN-NANBEIGE-P2.md §1.3). Set it so the
+    // hat branch activates only for this looped arch.
+    loop_n_phys = n_phys;
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -176,7 +181,7 @@ llama_model_nanbeige::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, n_layer - 1); // last loop pass's hat frames the output
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

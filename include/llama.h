@@ -707,6 +707,22 @@ extern "C" {
             llama_seq_id seq_id,
             int32_t adapter_idx);
 
+    // Fork hats: per-loop-step (depth-pass) LoRA routing for looped archs
+    // (nanbeige). Register an ordered adapter pool (index = hat id), then
+    // assign each loop step to a pool slot. Within a single llama_decode, each
+    // depth pass uses its own adapter for ALL tokens (whole-layer add, no mask
+    // tensor — loop_step = il / n_phys is a graph-build-time constant).
+    LLAMA_API int32_t llama_set_loop_adapters(
+            struct llama_context * ctx,
+            struct llama_adapter_lora ** adapters,
+            size_t n_adapters);
+
+    // Assign loop step loop_step to pool index adapter_idx (-1 = no adapter / base).
+    LLAMA_API int32_t llama_set_loop_adapter(
+            struct llama_context * ctx,
+            int32_t loop_step,
+            int32_t adapter_idx);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

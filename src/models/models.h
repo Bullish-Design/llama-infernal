@@ -433,6 +433,10 @@ struct llama_model_nanbeige : public llama_model_base {
     int  n_layer_phys = 0;
     bool skip_loop_final_norm = false;
 
+    // Fork hats: the nanbeige graph loops n_loops passes over n_layer_phys
+    // physical layers (logical layers expanded to n_layer_phys * n_loops).
+    int32_t loop_count() const override { return n_loops; }
+
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     };

@@ -1357,6 +1357,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     seq_loras        (params.seq_loras),
     seq_adapter_map  (params.seq_adapter_map),
+    loop_hat_map     (params.loop_hat_map),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1384,11 +1385,40 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+                int   il) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
+    }
+
+    // Fork hats: per-loop-step (depth-pass) LoRA routing for looped archs
+    // (nanbeige). loop_step = il / loop_n_phys is a graph-build-time constant
+    // (PORT-PLAN-NANBEIGE-P2.md §1.3): the whole layer shares one hat, so the
+    // delta is a plain ggml_add over ALL tokens — no per-token mask tensor.
+    // The selected adapter is baked into the graph at build time; the setters
+    // set sched_need_reserve so a changed loop_hat_map forces a rebuild
+    // (can_reuse caveat R3). Hat path replaces base/seq lora for this layer.
+    if (il >= 0 && loop_hat_map != nullptr && !loop_hat_map->empty() && loop_n_phys > 0 && seq_loras != nullptr) {
+        const int32_t j = il / loop_n_phys;
+        if (j >= 0 && (size_t) j < loop_hat_map->size()) {
+            const int32_t k = (*loop_hat_map)[j];
+            if (k >= 0 && k < (int32_t) seq_loras->size()) {
+                llama_adapter_lora * ad = (*seq_loras)[k];
+                llama_adapter_lora_weight * lw = ad->get_weight(w);
+                if (lw != nullptr) {
+                    const float scale = lw->get_scale(ad->alpha, 1.0f);
+                    ggml_tensor * ab_cur = ggml_mul_mat(
+                            ctx0, lw->b,
+                            ggml_mul_mat(ctx0, lw->a, cur)
+                            );
+                    ab_cur = ggml_scale(ctx0, ab_cur, scale);
+                    res = ggml_add(ctx0, res, ab_cur); // whole layer, all tokens
+                }
+            }
+        }
+        return res;
     }
 
     // P2 fork: mixed-batch per-sequence LoRA routing. Each token's delta comes from
@@ -1529,7 +1559,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
 
     if (layer.wqkv) {
         // fused QKV path
-        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
+        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s, il);
         cb(qkv, "wqkv", il);
         if (layer.wqkv_b) {
             qkv = ggml_add(ctx0, qkv, layer.wqkv_b);
@@ -1549,7 +1579,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
         // separate Q/K/V path
-        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s, il);
         cb(Qcur, "Qcur", il);
         if (layer.wq_b) {
             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
@@ -1559,7 +1589,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s, il);
         cb(Kcur, "Kcur", il);
         if (layer.wk_b) {
             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
@@ -1569,7 +1599,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s, il);
         cb(Vcur, "Vcur", il);
         if (layer.wv_b) {
             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
@@ -1630,7 +1660,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur, nullptr, il) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1647,12 +1677,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp);
+                    cur = build_lora_mm(gate, tmp, nullptr, il);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = build_lora_mm(gate, cur, nullptr, il);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1760,7 +1790,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
+        cur = build_lora_mm(down, cur, nullptr, il);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -2644,7 +2674,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, il);
     }
 
     if (wo_b) {
@@ -2749,13 +2779,13 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
-            cur = build_lora_mm(wo, cur);
+            cur = build_lora_mm(wo, cur, nullptr, il);
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
-            cur = build_lora_mm(wo, cur, wo_s);
+            cur = build_lora_mm(wo, cur, wo_s, il);
         }
     }
 
@@ -2836,13 +2866,13 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
-            cur = build_lora_mm(wo, cur);
+            cur = build_lora_mm(wo, cur, nullptr, il);
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
-            cur = build_lora_mm(wo, cur, wo_s);
+            cur = build_lora_mm(wo, cur, wo_s, il);
         }
     }
 
@@ -2919,7 +2949,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, il);
     }
 
     if (wo_b) {
@@ -3002,7 +3032,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, il);
     }
 
     if (wo_b) {
@@ -3061,7 +3091,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, il);
     }
 
     if (wo_b) {

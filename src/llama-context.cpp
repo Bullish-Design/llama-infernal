@@ -1293,6 +1293,27 @@ void llama_context::set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx) {
     seq_adapter_map[seq_id] = adapter_idx;
 }
 
+void llama_context::set_loop_adapters(llama_adapter_lora ** adapters, size_t n_adapters) {
+    // Fork hats: register the ordered adapter pool (shared with seq routing),
+    // sized to this model's loop count. Hat deltas are baked into the graph at
+    // build time, so a changed map must force a rebuild (sched_need_reserve).
+    seq_loras.assign(adapters, adapters + n_adapters);
+    loop_hat_map.assign((size_t) model.loop_count(), -1);
+    sched_need_reserve = true;
+}
+
+void llama_context::set_loop_adapter(int32_t loop_step, int32_t adapter_idx) {
+    if (loop_hat_map.empty()) {
+        loop_hat_map.assign((size_t) model.loop_count(), -1);
+    }
+    if (loop_step < 0 || (size_t) loop_step >= loop_hat_map.size()) {
+        LLAMA_LOG_ERROR("%s: loop_step %d out of range [0, %zu)\n", __func__, loop_step, loop_hat_map.size());
+        return;
+    }
+    loop_hat_map[loop_step] = adapter_idx;
+    sched_need_reserve = true;
+}
+
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -2449,6 +2470,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.seq_loras       =*/ &seq_loras,
         /*.seq_adapter_map =*/ seq_adapter_map.data(),
+        /*.loop_hat_map    =*/ loop_hat_map.empty() ? nullptr : &loop_hat_map,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
@@ -3866,6 +3888,28 @@ int32_t llama_set_seq_adapter(
             llama_seq_id seq_id,
             int32_t adapter_idx) {
     ctx->set_seq_adapter(seq_id, adapter_idx);
+
+    return 0;
+}
+
+int32_t llama_set_loop_adapters(
+            llama_context * ctx,
+            llama_adapter_lora ** adapters,
+            size_t n_adapters) {
+    if (adapters == nullptr) {
+        GGML_ASSERT(n_adapters == 0 && "invalid llama_set_loop_adapters call");
+    }
+
+    ctx->set_loop_adapters(adapters, n_adapters);
+
+    return 0;
+}
+
+int32_t llama_set_loop_adapter(
+            llama_context * ctx,
+            int32_t loop_step,
+            int32_t adapter_idx) {
+    ctx->set_loop_adapter(loop_step, adapter_idx);
 
     return 0;
 }

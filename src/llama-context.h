@@ -127,6 +127,10 @@ struct llama_context {
     void set_seq_adapters(llama_adapter_lora ** adapters, size_t n_adapters);
     void set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx);
 
+    // Fork hats: per-loop-step (depth-pass) LoRA routing for looped archs
+    void set_loop_adapters(llama_adapter_lora ** adapters, size_t n_adapters);
+    void set_loop_adapter(int32_t loop_step, int32_t adapter_idx);
+
     bool set_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -293,6 +297,13 @@ private:
     // per-seq_id adapter index (-1 = no adapter), sized LLAMA_MAX_SEQ.
     std::vector<llama_adapter_lora *> seq_loras;
     std::vector<int32_t>              seq_adapter_map;
+
+    // Fork hats: per-loop-step LoRA routing (looped archs, e.g. nanbeige).
+    // loop_hat_map[j] = adapter pool index for loop pass j (-1 = base), sized
+    // model.loop_count(); shares the seq_loras pool. Hat deltas are baked into
+    // the graph at build time (see build_lora_mm), so changing the map must
+    // set sched_need_reserve to force a graph rebuild (can_reuse caveat R3).
+    std::vector<int32_t>              loop_hat_map;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

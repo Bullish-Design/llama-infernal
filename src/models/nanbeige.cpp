@@ -139,7 +139,7 @@ llama_model_nanbeige::graph::graph(const llama_model & model, const llm_graph_pa
             cb(cur, "attn_out", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -176,6 +176,14 @@ llama_model_nanbeige::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     cur = inpL;
+
+    // Keep the out_ids input consumed in the default (unmasked) case too: the
+    // in-loop selection is gated on embeddings_nextn_masked (mirrors qwen35 /
+    // cohere2moe), so the full-row ffn keeps the per-token seq/hat LoRA masks
+    // valid at the last layer; select the logits rows afterwards.
+    if (inp_out_ids && !cparams.embeddings_nextn_masked) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

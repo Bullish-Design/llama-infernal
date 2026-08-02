@@ -703,6 +703,20 @@ extern "C" {
             size_t n_adapters,
             float * scales);
 
+    // P2 fork: mixed-batch per-sequence LoRA routing. Register an ordered adapter
+    // pool (index = routing id); then assign each sequence to a pool slot. Within a
+    // single llama_decode, different sequences use different adapters.
+    LLAMA_API int32_t llama_set_seq_adapters(
+            struct llama_context * ctx,
+            struct llama_adapter_lora ** adapters,
+            size_t n_adapters);
+
+    // Assign sequence seq_id to pool index adapter_idx (-1 = no adapter / base).
+    LLAMA_API int32_t llama_set_seq_adapter(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t adapter_idx);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

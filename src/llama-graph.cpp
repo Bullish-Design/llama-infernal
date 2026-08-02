@@ -1355,6 +1355,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    seq_loras        (params.seq_loras),
+    seq_adapter_map  (params.seq_adapter_map),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1387,6 +1389,35 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
+    }
+
+    // P2 fork: mixed-batch per-sequence LoRA routing. Each token's delta comes from
+    // its own sequence's adapter. Correctness-first (unfused): compute every pool
+    // adapter's delta over all tokens and mask it to the tokens that selected it.
+    if (seq_loras != nullptr && !seq_loras->empty()) {
+        if (seq_lora_mask == nullptr) {
+            build_inp_seq_lora_mask();
+        }
+        for (int32_t k = 0; k < (int32_t) seq_loras->size(); ++k) {
+            llama_adapter_lora * ad = (*seq_loras)[k];
+            llama_adapter_lora_weight * lw = ad->get_weight(w);
+            if (lw == nullptr) {
+                continue;
+            }
+            const float scale = lw->get_scale(ad->alpha, 1.0f);
+            ggml_tensor * ab_cur = ggml_mul_mat(
+                    ctx0, lw->b,
+                    ggml_mul_mat(ctx0, lw->a, cur)
+                    );
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+            // per-token membership for adapter k: contiguous column -> [1, n_tokens]
+            ggml_tensor * mcol = ggml_view_1d(ctx0, seq_lora_mask, n_tokens,
+                    (size_t) k * n_tokens * ggml_element_size(seq_lora_mask));
+            mcol = ggml_reshape_2d(ctx0, mcol, 1, n_tokens);
+            ab_cur = ggml_mul(ctx0, ab_cur, mcol); // broadcast [1,n_tokens] over [out,n_tokens]
+            res = ggml_add(ctx0, res, ab_cur);
+        }
+        return res;
     }
 
     for (const auto & lora : *loras) {
@@ -2233,6 +2264,40 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
     ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
+    if (mask == nullptr) {
+        return;
+    }
+    const int64_t n_tokens = ubatch->n_tokens;
+    std::vector<float> data((size_t) n_adapters * n_tokens, 0.0f);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        // primary sequence id for this token routes to a pool adapter (or -1 = none)
+        const llama_seq_id sid = ubatch->seq_id[t][0];
+        const int32_t k = seq_adapter_map[sid];
+        if (k >= 0 && k < n_adapters) {
+            data[(size_t) k * n_tokens + t] = 1.0f; // layout [n_tokens, n_adapters]: column k contiguous
+        }
+    }
+    ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(float));
+}
+
+ggml_tensor * llm_graph_context::build_inp_seq_lora_mask() const {
+    const int32_t n_adapters = (int32_t) seq_loras->size();
+
+    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_adapters);
+
+    auto & cur = inp->mask;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_tokens, n_adapters);
+    ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    seq_lora_mask = cur; // cache for build_lora_mm (mutable member)
 
     return cur;
 }

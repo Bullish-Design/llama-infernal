@@ -166,6 +166,21 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// per-sequence (mixed-batch) LoRA routing mask (P2 fork)
+class llm_graph_input_seq_lora_mask : public llm_graph_input_i {
+public:
+    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, int32_t n_adapters)
+        : seq_adapter_map(seq_adapter_map), n_adapters(n_adapters) {}
+    virtual ~llm_graph_input_seq_lora_mask() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = 1.0 where token's seq routes to adapter k
+
+    const int32_t * seq_adapter_map;
+    const int32_t   n_adapters;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -685,6 +700,9 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    // per-sequence (mixed-batch) LoRA routing: ordered adapter pool + seq->idx map
+    const std::vector<llama_adapter_lora *> * seq_loras;
+    const int32_t                           * seq_adapter_map;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -925,6 +943,10 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    // per-sequence (mixed-batch) LoRA routing (P2 fork)
+    const std::vector<llama_adapter_lora *> * seq_loras        = nullptr;
+    const int32_t                           * seq_adapter_map  = nullptr;
+    mutable ggml_tensor                     * seq_lora_mask    = nullptr; // F32 [n_tokens, n_adapters], built lazily
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -1051,6 +1073,7 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+    ggml_tensor * build_inp_seq_lora_mask() const; // P2 fork: mixed-batch LoRA routing mask
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

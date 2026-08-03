@@ -35,11 +35,13 @@ struct block_q8_1_mmq {
     // The partial sums are obtained by summing up a subgroup of the contained values (prior to quantization)
     //     and are only needed for performance reasons.
     //
-    // The exact data stored depends on the x data type.
+    // The exact data stored depends on the x data type. The activation scales/partial sums are stored in
+    // fp32: in fp16 they overflow for large activation magnitudes (see block_q8_1_f32), producing inf/NaN
+    // dot products on the CUDA LoRA path with full-coverage adapters.
     union {
         float d4[4];    // 1 32 bit scale per 32 values, stored as d0,d1,d2,d3
-        half2 ds4[4];   // 1 16 bit scale + 1 16 bit partial sum per 32 values, stored as d0,s0,d1,s1,d2,s2,d3,s3
-        half  d2s6[8];  // 1 16 bit scale per 64 values + 1 16 bit partial sum per 16 values for the first 96 values,
+        float2 ds4[4];  // 1 32 bit scale + 1 32 bit partial sum per 32 values, stored as d0,s0,d1,s1,d2,s2,d3,s3
+        float  d2s6[8]; // 1 32 bit scale per 64 values + 1 32 bit partial sum per 16 values for the first 96 values,
                         //     stored as d0,d1,s1,s2,s3,s4,s5
     };
     int8_t qs[QK8_1_MMQ];
@@ -53,9 +55,9 @@ struct block_fp4_mmq {
     int8_t   qs[QK_FP4_MMQ / 2];
 };
 
-static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
-static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
-static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
+static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(float2), "Unexpected block_q8_1_mmq size");
+static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1_f32),   "Unexpected block_q8_1_mmq size");
+static_assert(sizeof(block_fp4_mmq)  == QK_FP4_MMQ/2 + 4*sizeof(uint32_t), "Unexpected block_fp4_mmq size");
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
@@ -116,8 +118,10 @@ struct tile_x_sizes {
 #define MMQ_TILE_NE_K 32
 
 // block_q8_1_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
-#define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
-#define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
+#define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_1)
+// FP4 (Blackwell) Y-tile stride: the fp4 activation scratch block has 4 uint32
+// scales (16 bytes) per 128 values, unlike the fp32-scaled block_q8_1_mmq.
+#define MMQ_TILE_Y_FP4_K (MMQ_TILE_NE_K +   MMQ_TILE_NE_K/QI8_1)
 
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
@@ -882,14 +886,17 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    // FP4 tile stores 8 blocks
+    // FP4 tile stores 8 blocks and its Y-tile stride matches the fp4 scratch block size.
     constexpr int ne_block = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) ? QK_FP4_MMQ : QK8_1_MMQ;
+    constexpr int tile_y_k = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) ? MMQ_TILE_Y_FP4_K : MMQ_TILE_Y_K;
 #else
     constexpr int ne_block = QK8_1_MMQ;
+    constexpr int tile_y_k = MMQ_TILE_Y_K;
 #endif  // defined(BLACKWELL_MMA_AVAILABLE)
+
+    int * tile_x = tile_y + GGML_PAD(J*tile_y_k, nwarps*warp_size);
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
@@ -903,7 +910,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+            for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];
@@ -919,7 +926,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+            for (int l0 = 0; l0 < J * tile_y_k; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
                 tile_y[l] = by0[l];

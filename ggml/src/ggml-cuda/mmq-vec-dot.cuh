@@ -16,8 +16,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_0, I);
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_0*VDR_Q4_0_Q8_1_MMQ) {
@@ -51,7 +51,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ>
                     (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0], u,
-                     x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                     x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)], y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1]);
             }
         }
     }
@@ -66,8 +66,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q4_1, I);
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_1*VDR_Q4_1_Q8_1_MMQ) {
@@ -101,7 +101,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMQ>
                     (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_1], u,
-                     x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                     x_dm[i*(MMQ_TILE_NE_K/QI4_1) + i/QI4_1 + k0/(QR4_1*QI4_1)], y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1]);
             }
         }
     }
@@ -116,7 +116,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
 // #pragma unroll
@@ -157,9 +157,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
-    const half2 * y_ds = (const half2 *) y;
+    const float2 * y_ds = (const float2 *) y;
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
@@ -182,7 +182,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
             if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
                 dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
             } else {
-                dB = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                dB = y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1].x;
             }
 
 #pragma unroll
@@ -213,9 +213,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
-    const half2 * y_ds = (const half2 *) y;
+    const float2 * y_ds = (const float2 *) y;
 
     tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
     float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
@@ -260,7 +260,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
                 if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
                     dB[l] =             y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
                 } else {
-                    dB[l] = __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    dB[l] = y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1].x;
                 }
             }
 
@@ -289,8 +289,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q5_1, I);
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
@@ -306,7 +306,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_1_q8_1_impl<QR5_1*VDR_Q5_1_Q8_1_MMQ>
                     (&x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
-                    x_dm[i*(MMQ_TILE_NE_K/QI5_1) + i/QI5_1 + k0/QI8_1], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_dm[i*(MMQ_TILE_NE_K/QI5_1) + i/QI5_1 + k0/QI8_1], y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1]);
             }
         }
     }
@@ -329,8 +329,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_dm = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_dm = (const float2 *) y;
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
@@ -349,7 +349,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
-            const float2 dsB = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+            const float2 dsB = y_dm[j*(MMQ_TILE_Y_K/2) + k01/QI8_1];
 
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
@@ -380,8 +380,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_dm = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_dm = (const float2 *) y;
 
     tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
     float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
@@ -423,7 +423,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int l = 0; l < tile_C::ne/2; ++l) {
                 const int j = j0 + tile_C::get_j(l);
 
-                dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                dsB[l] = y_dm[j*(MMQ_TILE_Y_K/2) + k01/QI8_1];
             }
 
 #pragma unroll
@@ -452,7 +452,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
 // #pragma unroll
@@ -495,7 +495,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
@@ -546,7 +546,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
     const int i0 = (threadIdx.y / ntx) * (ntx*tile_A::I);
@@ -622,15 +622,15 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_K, I);
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
     float2 y_df[J/nwarps];
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps) {
         const int j = j0 + threadIdx.y;
 
-        y_df[j0/nwarps] = __half22float2(y_ds[j*MMQ_TILE_Y_K]);
+        y_df[j0/nwarps] = y_ds[j*(MMQ_TILE_Y_K/2)];
     }
 
 #pragma unroll
@@ -649,7 +649,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q2_K_q8_1_impl_mmq<ns>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
                     &x_dm[i*(MMQ_TILE_NE_K + 1) + k0/4], k01 < MMQ_TILE_NE_K/2 ? y_df[j0/nwarps].x : y_df[j0/nwarps].y,
-                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
+                    &y_ds[j*(MMQ_TILE_Y_K/2) + (1 + k01/QI8_1)]);
             }
         }
     }
@@ -672,7 +672,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q2_K_q8_1_impl_mmq<ns>(
                     &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01],
                     &x_dm[i*(MMQ_TILE_NE_K + 1) + k0/4], k01 < MMQ_TILE_NE_K/2 ? y_df[j0/nwarps].x : y_df[j0/nwarps].y,
-                    &y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
+                    &y_ds[j*(MMQ_TILE_Y_K/2) + (1 + k01/QI8_1)]);
             }
         }
     }
@@ -695,8 +695,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + MMQ_TILE_NE_K*2;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
@@ -715,10 +715,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
             const int j = j0 + tile_C::get_j(0);
-            const float dB = (k01 < MMQ_TILE_NE_K/2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K]).x : __half22float2(y_ds[j*MMQ_TILE_Y_K]).y;
+            const float dB = (k01 < MMQ_TILE_NE_K/2) ? y_ds[j*(MMQ_TILE_Y_K/2)].x : y_ds[j*(MMQ_TILE_Y_K/2)].y;
             const float sB = (k01 >= MMQ_TILE_NE_K * 3/4) ? 0
-                                              : (((k01/4)%2) ? __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]).y
-                                                             : __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]).x);
+                                              : (((k01/4)%2) ? y_ds[j*(MMQ_TILE_Y_K/2) + (1 + k01/QI8_1)].y
+                                                             : y_ds[j*(MMQ_TILE_Y_K/2) + (1 + k01/QI8_1)].x);
 
             tile_C Cm;
             if (k01 >= MMQ_TILE_NE_K * 3/4) {
@@ -765,8 +765,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + MMQ_TILE_NE_K*2;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
     const int i0 = (threadIdx.y / ntx) * (ntx*tile_A::I);
 
@@ -810,7 +810,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int l = 0; l < tile_C::ne/2; ++l) {
             const int j = j0 + tile_C::get_j(l);
 
-            dB[l] = __half22float2(y_ds[j*MMQ_TILE_Y_K]);
+            dB[l] = y_ds[j*(MMQ_TILE_Y_K/2)];
         }
 
 #pragma unroll
@@ -856,7 +856,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int l = 0; l < tile_C::ne/2; ++l) {
                 const int j = j0 + tile_C::get_j(l);
 
-                sB[l] = __half22float2(y_ds[j*MMQ_TILE_Y_K + (1 + k01/QI8_1)]);
+                sB[l] = y_ds[j*(MMQ_TILE_Y_K/2) + (1 + k01/QI8_1)];
             }
 
 #pragma unroll
@@ -885,7 +885,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
     const int   * x_sc = (const int   *) x_df + txs.dm;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
 // #pragma unroll
@@ -920,8 +920,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
     const int   * x_sc = (const int   *) x_dm + txs.dm;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_K*VDR_Q4_K_Q8_1_MMQ) {
@@ -939,7 +939,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_K_q8_1_impl_mmq(
                     &x_qs[i*(MMQ_TILE_NE_K + 1) + k0/2], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_dm[i], &y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1]);
             }
         }
     }
@@ -955,8 +955,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * x_qs = (const int   *) x;
     const half2 * x_dm = (const half2 *) x_qs + txs.qs;
     const int   * x_sc = (const int   *) x_dm + txs.dm;
-    const int   * y_qs = (const int   *) y + 4;
-    const half2 * y_ds = (const half2 *) y;
+    const int   * y_qs = (const int   *) y + 8;
+    const float2 * y_ds = (const float2 *) y;
 
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR5_K*VDR_Q5_K_Q8_1_MMQ) {
@@ -974,7 +974,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q5_K_q8_1_impl_mmq(
                     &x_qs[i*(QR5_K*MMQ_TILE_NE_K + 1) + k0], &y_qs[j*MMQ_TILE_Y_K + k01], sc, sc+8,
-                    x_dm[i], &y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                    x_dm[i], &y_ds[j*(MMQ_TILE_Y_K/2) + k01/QI8_1]);
             }
         }
     }
@@ -990,7 +990,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
     const int   * x_sc = (const int   *) x_df + txs.dm;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
 // #pragma unroll
@@ -1033,7 +1033,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
     const int   * x_sc = (const int   *) x_df + MMQ_TILE_NE_K/QI6_K;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
@@ -1085,7 +1085,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + MMQ_TILE_NE_K*2;
     const int   * x_sc = (const int   *) x_df + MMQ_TILE_NE_K/QI6_K;
-    const int   * y_qs = (const int   *) y + 4;
+    const int   * y_qs = (const int   *) y + 8;
     const float * y_df = (const float *) y;
 
     const int i0 = (threadIdx.y / ntx) * (ntx*tile_A::I);
@@ -1196,7 +1196,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int ntx           = rows_per_warp / tile_C::I;
     constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J;
 
-    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_FP4_K);
 
     const int *      x_qs = (const int *) x;
     const uint32_t * x_sc = (const uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
@@ -1230,8 +1230,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
         for (int frag = 0; frag < nfrags; ++frag) {
             const int k0 = frag * tile_B::J;
-            load_generic(B[frag], y_qs + j0 * MMQ_TILE_Y_K + k0, MMQ_TILE_Y_K);
-            scaleB[frag] = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_K + frag];
+            load_generic(B[frag], y_qs + j0 * MMQ_TILE_Y_FP4_K + k0, MMQ_TILE_Y_FP4_K);
+            scaleB[frag] = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_FP4_K + frag];
         }
 
 #pragma unroll

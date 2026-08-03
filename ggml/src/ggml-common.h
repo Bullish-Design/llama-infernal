@@ -268,6 +268,20 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding");
 
+// CUDA-only scratch layout for the Q8_1-quantized input ACTIVATION (src1) in the
+// mmvq (GEMV) kernels. Unlike the on-disk block_q8_1 (whose layout is a frozen
+// GGUF format), the block scale and raw sum are stored in fp32: stored in fp16
+// they overflow for large activation magnitudes (d = amax/127 exceeds the fp16
+// maximum 65504 when amax > 8.3e6, and the raw block sum overflows even sooner),
+// producing inf/NaN dot products on the CUDA LoRA path with full-coverage
+// adapters. Never used for on-disk tensors; CPU and SYCL backends are unaffected.
+typedef struct {
+    float   d;          // delta
+    float   s;          // raw sum of the block values (not d * sum(qs))
+    int8_t  qs[QK8_1];  // quants
+} block_q8_1_f32;
+static_assert(sizeof(block_q8_1_f32) == 2*sizeof(float) + QK8_1, "wrong q8_1_f32 block size/padding");
+
 //
 // Ternary quantization
 //

@@ -75,7 +75,7 @@ static __global__ void quantize_q8_1(
 
     const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
 
-    block_q8_1 * y = (block_q8_1 *) vy;
+    block_q8_1_f32 * y = (block_q8_1_f32 *) vy;
 
     const int64_t ib  = i_cont / QK8_1; // block index
     const int64_t iqs = i_cont % QK8_1; // quant index
@@ -97,7 +97,8 @@ static __global__ void quantize_q8_1(
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    y[ib].d = d;
+    y[ib].s = sum;
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -546,7 +547,7 @@ static __global__ void quantize_mmq_q8_1(
             }
         } else if (iqs % 32 == 0) {
             if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
-                y[ib].ds4[iqs/32] = make_half2(d, sum);
+                y[ib].ds4[iqs/32] = make_float2(d, sum);
             } else {
                 y[ib].d4[iqs/32]  = d;
             }

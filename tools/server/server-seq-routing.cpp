@@ -180,7 +180,18 @@ std::vector<seq_routing_finding> seq_routing_refusals(const seq_routing_config &
             "request naming another. Also incompatible: --cache-idle-slots, --slot-save-path." });
     }
 
-    // R-5 [S11-P5]
+    // R-5 [S11-P5]. An adapter whose GGUF cannot be read has unknown targets,
+    // so it cannot be cleared. Refuse it rather than pass it: a scan that
+    // cannot see a tensor name must never read as "no expert weights here".
+    for (const auto & a : cfg.pool) {
+        if (!a.gguf_ok) {
+            out.push_back({ "R-5", string_format(
+                "--lora-seq-routing: adapter %s could not be read as a GGUF, so the weights it targets are "
+                "unknown. build_lora_mm_id has no sequence-routing branch, so a mixture-of-experts delta would "
+                "be silently dropped. Refusing.",
+                a.path.c_str()) });
+        }
+    }
     for (const auto & a : cfg.pool) {
         if (!a.moe_tensor.empty()) {
             out.push_back({ "R-5", string_format(

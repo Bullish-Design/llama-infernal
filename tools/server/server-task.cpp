@@ -1656,12 +1656,13 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft,
+                                                      const std::vector<common_adapter_lora_info> & lora) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (cur_lcp_len == (int) prompt.tokens.size() && are_lora_equal(it->lora, lora)) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
@@ -1686,7 +1687,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->lora, lora)) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1733,12 +1734,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.lora   =*/ lora,
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               const std::vector<common_adapter_lora_info> & lora_new) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1750,6 +1753,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // a cached prompt only matches a request under the same adapter set
+        if (!are_lora_equal(it->lora, lora_new)) {
+            continue;
+        }
+
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();

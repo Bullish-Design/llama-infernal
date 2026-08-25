@@ -1282,19 +1282,26 @@ void llama_context::set_seq_adapters(llama_adapter_lora ** adapters, size_t n_ad
     seq_loras.assign(adapters, adapters + n_adapters);
     if (seq_adapter_map.empty()) {
         seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
+        seq_adapter_scale.assign((size_t) cparams.n_seq_max, 1.0f);
     }
     sched_need_reserve = true;
 }
 
 int32_t llama_context::set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx) {
+    return set_seq_adapter_scaled(seq_id, adapter_idx, 1.0f);
+}
+
+int32_t llama_context::set_seq_adapter_scaled(llama_seq_id seq_id, int32_t adapter_idx, float scale) {
     if (seq_adapter_map.empty()) {
         seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
+        seq_adapter_scale.assign((size_t) cparams.n_seq_max, 1.0f);
     }
     if (seq_id < 0 || (size_t) seq_id >= seq_adapter_map.size()) {
         LLAMA_LOG_ERROR("%s: seq_id %d out of range [0, %zu)\n", __func__, seq_id, seq_adapter_map.size());
         return -1;
     }
-    seq_adapter_map[seq_id] = adapter_idx;
+    seq_adapter_map  [seq_id] = adapter_idx;
+    seq_adapter_scale[seq_id] = scale;
     return 0;
 }
 
@@ -2498,6 +2505,7 @@ llm_graph_params llama_context::graph_params(
         /*.seq_loras       =*/ &seq_loras,
         /*.seq_adapter_map =*/ seq_adapter_map.data(),
         /*.n_seq_adapter_map =*/ (uint32_t) seq_adapter_map.size(),
+        /*.seq_adapter_scale =*/ seq_adapter_scale.data(),
         /*.loop_hat_map    =*/ loop_hat_map.empty() ? nullptr : &loop_hat_map,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
@@ -3948,6 +3956,16 @@ int32_t llama_set_loop_adapter(
             int32_t loop_step,
             int32_t adapter_idx) {
     ctx->set_loop_adapter(loop_step, adapter_idx);
+
+    return 0;
+}
+
+int32_t llama_set_seq_adapter_scaled(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t adapter_idx,
+            float scale) {
+    ctx->set_seq_adapter_scaled(seq_id, adapter_idx, scale);
 
     return 0;
 }

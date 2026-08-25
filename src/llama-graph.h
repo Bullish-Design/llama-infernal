@@ -169,18 +169,19 @@ public:
 // per-sequence (mixed-batch) LoRA routing mask (P2 fork)
 class llm_graph_input_seq_lora_mask : public llm_graph_input_i {
 public:
-    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, uint32_t n_seq_adapter_map, int32_t n_adapters)
-        : seq_adapter_map(seq_adapter_map), n_seq_adapter_map(n_seq_adapter_map), n_adapters(n_adapters) {}
+    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, uint32_t n_seq_adapter_map, const float * seq_adapter_scale, int32_t n_adapters)
+        : seq_adapter_map(seq_adapter_map), n_seq_adapter_map(n_seq_adapter_map), seq_adapter_scale(seq_adapter_scale), n_adapters(n_adapters) {}
     virtual ~llm_graph_input_seq_lora_mask() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = 1.0 where token's seq routes to adapter k
+    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = the seq's scale where token's seq routes to adapter k
 
     const int32_t * seq_adapter_map;
     // entries in seq_adapter_map. The map arrives as a bare pointer, so its
     // length has to travel beside it; set_input needs it to bound the read.
     const uint32_t  n_seq_adapter_map;
+    const float   * seq_adapter_scale; // per-seq_id scale; null = all 1.0
     const int32_t   n_adapters;
 };
 
@@ -750,6 +751,7 @@ struct llm_graph_params {
     const std::vector<llama_adapter_lora *> * seq_loras;
     const int32_t                           * seq_adapter_map;
     uint32_t                                  n_seq_adapter_map;
+    const float                             * seq_adapter_scale;
     // fork hats: per-loop-step LoRA routing (looped archs); null unless set
     const std::vector<int32_t>              * loop_hat_map;
     const llama_memory_context_i * mctx;
@@ -993,9 +995,10 @@ struct llm_graph_context {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     // per-sequence (mixed-batch) LoRA routing (P2 fork)
-    const std::vector<llama_adapter_lora *> * seq_loras        = nullptr;
-    const int32_t                           * seq_adapter_map  = nullptr;
+    const std::vector<llama_adapter_lora *> * seq_loras         = nullptr;
+    const int32_t                           * seq_adapter_map   = nullptr;
     uint32_t                                  n_seq_adapter_map = 0;
+    const float                             * seq_adapter_scale = nullptr; // per-seq_id scale; null = all 1.0
     mutable ggml_tensor                     * seq_lora_mask    = nullptr; // F32 [n_tokens, n_adapters], built lazily
     // fork hats: per-loop-step LoRA routing; loop_n_phys is set by looped arch
     // graphs (nanbeige) so build_lora_mm can compute loop_step = il / n_phys

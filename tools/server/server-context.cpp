@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-seq-routing.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -36,6 +38,14 @@
 #endif
 
 using json = nlohmann::ordered_json;
+
+// P2 fork: the sequence-routing entry points, resolved once from the loaded
+// libllama. Resolution never fails; a missing name lands in api.missing and
+// R-1 refuses at startup with that name.
+static const seq_routing_api & seq_api() {
+    static const seq_routing_api api = seq_routing_api::resolve();
+    return api;
+}
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
@@ -299,6 +309,12 @@ struct server_slot {
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
+    // P2 fork: --lora-seq-routing. The adapter is a property of the sequence,
+    // so the slot carries a pool index instead of a context-wide install.
+    bool    seq_routing   = false;
+    int32_t lora_pool_idx = -1;   // -1 = base model
+    float   lora_scale    = 1.0f;
+
     // sampling
     json json_schema;
 
@@ -368,6 +384,17 @@ struct server_slot {
         // clear alora start
         alora_invocation_start = -1;
 
+        // P2 fork edit 4.5: clear the route. Nothing in the library writes -1
+        // back into seq_adapter_map when a sequence is freed, so a released
+        // slot would keep its old route (spikes/S11/interactions.md 8.5).
+        //
+        // lora_pool_idx and lora_scale survive this, exactly as slot.lora does:
+        // they describe the adapter the slot's KV was computed under, and the
+        // next task compares against them to decide whether to clear it.
+        if (seq_routing && seq_api().set_seq_adapter) {
+            seq_api().set_seq_adapter(ctx_tgt, id, -1);
+        }
+
         // clear multimodal state
         mbatch.reset();
     }
@@ -420,9 +447,12 @@ struct server_slot {
     bool can_batch_with(server_slot & other_slot) const {
         GGML_ASSERT(task);
 
+        // P2 fork edit 4.4: under routing the adapter is a property of the
+        // sequence, not of the context, so two slots holding different adapters
+        // may share one decode. Keep the clause when routing is off.
         return task->type == other_slot.task->type
             && inp_embd.size() == other_slot.inp_embd.size()
-            && are_lora_equal(lora, other_slot.lora);
+            && (seq_routing || are_lora_equal(lora, other_slot.lora));
     }
 
     bool has_budget(const common_params & global_params) {
@@ -954,6 +984,11 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // P2 fork: --lora-seq-routing. The pool is fixed at startup; a request names
+    // one pool index, and every decode step routes each busy slot to its index.
+    bool seq_routing_enabled = false;
+    std::vector<llama_adapter_lora *> seq_pool;
+
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
@@ -1338,8 +1373,90 @@ private:
             model_dft = nullptr;
         }
 
+        // P2 fork edit 4.1: register the adapter pool once, then refuse or warn.
+        // The list is observed, not derived: every item is backed by a probe in
+        // .scratch/projects/005-server-seq-routing/spikes/S11/interactions.md.
+        if (params_base.lora_seq_routing) {
+            if (params_base.lora_adapters.empty()) {
+                SRV_ERR("%s", "--lora-seq-routing needs at least one --lora adapter to fill the routing pool\n");
+                return false;
+            }
+
+            seq_routing_config cfg;
+
+            cfg.missing_symbols = seq_api().missing;
+            cfg.build_info      = llama_build_info();
+
+            cfg.n_parallel = params_base.n_parallel;
+            cfg.n_seq_max  = (int32_t) llama_n_seq_max(ctx_tgt);
+            // graph_max_nodes is budgeted once from min(n_ctx, n_ubatch)
+            cfg.n_ubatch   = std::min(llama_n_ctx(ctx_tgt), llama_n_ubatch(ctx_tgt));
+            cfg.n_tensors  = seq_routing_model_n_tensors(params_base.model.path);
+
+            cfg.cache_ram_mib    = params_base.cache_ram_mib;
+            cfg.cache_idle_slots = params_base.cache_idle_slots;
+            cfg.slot_save_path   = params_base.slot_save_path;
+            cfg.has_draft_model  = ctx_dft != nullptr;
+
+            for (auto & la : params_base.lora_adapters) {
+                cfg.pool.push_back(seq_routing_scan_adapter(la.path, la.ptr));
+            }
+
+            // R-2 probes the library instead of assuming it. A library carrying
+            // the stage 0.5 node-budget fix returns -1 for an out-of-range
+            // seq_id and has no pool ceiling; an unfixed one returns 0 and
+            // aborts inside llama_decode past the ceiling.
+            if (seq_api().set_seq_adapter) {
+                const int32_t rc = seq_api().set_seq_adapter(ctx_tgt, (llama_seq_id) cfg.n_seq_max, -1);
+                cfg.node_budget_fixed = rc != 0;
+            }
+
+            // R-3 and R-6 cannot be produced by this server: it has no hats
+            // surface, and cparams.n_seq_max is assigned from params.n_parallel.
+            // Both are defence in depth, so this hook is the only way to prove
+            // they fire rather than to read that they would.
+            if (const char * force = getenv("LLAMA_SEQ_ROUTING_TEST_FORCE")) {
+                if (strcmp(force, "hats") == 0) {
+                    cfg.hats_registered = true;
+                } else if (strcmp(force, "n_seq_max") == 0) {
+                    cfg.n_seq_max = cfg.n_parallel - 1;
+                }
+                SRV_WRN("LLAMA_SEQ_ROUTING_TEST_FORCE = %s\n", force);
+            }
+
+            const auto refusals = seq_routing_refusals(cfg);
+            for (const auto & r : refusals) {
+                SRV_ERR("%s %s\n", r.id.c_str(), r.message.c_str());
+            }
+            if (!refusals.empty()) {
+                return false;
+            }
+
+            for (const auto & w : seq_routing_warnings(cfg)) {
+                SRV_WRN("%s %s\n", w.id.c_str(), w.message.c_str());
+            }
+
+            seq_pool.clear();
+            for (auto & la : params_base.lora_adapters) {
+                seq_pool.push_back(la.ptr);
+            }
+
+            const int32_t rc = seq_api().set_seq_adapters(ctx_tgt, seq_pool.data(), seq_pool.size());
+            if (rc != 0) {
+                SRV_ERR("--lora-seq-routing: llama_set_seq_adapters failed, rc=%d\n", rc);
+                return false;
+            }
+
+            seq_routing_enabled = true;
+
+            SRV_INF("--lora-seq-routing: pool of %d adapters registered, library node budget %s\n",
+                    (int32_t) seq_pool.size(), cfg.node_budget_fixed ? "fixed" : "UNFIXED");
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
+
+            slot.seq_routing = seq_routing_enabled;
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
@@ -1741,9 +1858,65 @@ private:
         return output;
     }
 
+    // P2 fork edit 4.2: resolve a request's adapter to a pool index.
+    // The pool is params_base.lora_adapters in order, so the request's own
+    // adapter id is already the pool index. A request that enables no adapter
+    // routes to -1, which is the base model and costs one column of zeros in
+    // the mask.
+    bool resolve_lora_pool_idx(const server_task & task,
+                               const std::vector<common_adapter_lora_info> & loras,
+                               int32_t & idx, float & scale) {
+        idx   = -1;
+        scale = 1.0f;
+
+        // construct_lora_list drops an id outside the pool without saying so,
+        // so Q-1 reads the request and not the resolved list.
+        for (const auto & [id, s] : task.params.lora) {
+            GGML_UNUSED(s);
+            if (id < 0 || (size_t) id >= seq_pool.size()) {
+                send_error(task, seq_routing_q1_message(id, seq_pool.size()), ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+
+        const auto enabled = lora_get_enabled_ids(loras);
+
+        if (enabled.size() > 1) {
+            send_error(task, seq_routing_q2_message(enabled.size()), ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        if (enabled.size() == 1) {
+            idx   = (int32_t) enabled[0];
+            scale = loras[enabled[0]].scale;
+        }
+
+        return true;
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
+        // P2 fork edits 4.2 and 4.5. The adapter rides the sequence, so the
+        // slot stores a pool index and the KV clear compares that index, not
+        // the context-wide adapter list.
+        if (seq_routing_enabled) {
+            slot.lora = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
+
+            int32_t idx   = -1;
+            float   scale = 1.0f;
+            if (!resolve_lora_pool_idx(task, slot.lora, idx, scale)) {
+                return false;
+            }
+
+            if (idx != slot.lora_pool_idx || scale != slot.lora_scale) {
+                SLT_TRC(slot, "clearing cache for route change. pool idx %d -> %d, scale %f -> %f\n",
+                        slot.lora_pool_idx, idx, (double) slot.lora_scale, (double) scale);
+                slot.prompt.clear();
+
+                slot.lora_pool_idx = idx;
+                slot.lora_scale    = scale;
+            }
+        } else if (!task.params.lora.empty()) {
+            // process per-request lora adapters
             auto task_loras = construct_lora_list(task.params.lora);
             if (!are_lora_equal(task_loras, slot.lora)) {
                 // if lora has changed, check to see if the cache should be cleared
@@ -2842,9 +3015,26 @@ private:
             auto & alora_scale       = batch.alora_scale;
             auto & alora_disabled_id = batch.alora_disabled_id;
 
-            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
-            // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            // P2 fork edit 4.3: route per sequence instead of installing one
+            // adapter context-wide. slot.id is the primary sequence id and the
+            // mask keys off ubatch->seq_id[t][0], so this routes exactly.
+            // set_seq_adapter_scaled sets no sched_need_reserve, so the loop is
+            // cheap per step.
+            //
+            // The SCALED form is mandatory: the unscaled call resets the
+            // sequence's scale to 1.0 and would silently drop every request's
+            // scale (S9, spikes/S11/interactions.md section 8.4).
+            if (seq_routing_enabled) {
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        seq_api().set_seq_adapter_scaled(ctx_tgt, slot.id, slot.lora_pool_idx, slot.lora_scale);
+                    }
+                }
+            } else {
+                // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
+                // apply lora, only need to do it once per batch
+                common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            }
 
             // if the lora is temporarily disabled for an alora, re-enable it
             // for next time

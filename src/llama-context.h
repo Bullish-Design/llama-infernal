@@ -125,7 +125,7 @@ struct llama_context {
 
     // P2 fork: mixed-batch per-sequence LoRA routing
     void set_seq_adapters(llama_adapter_lora ** adapters, size_t n_adapters);
-    void set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx);
+    int32_t set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx);
 
     // Fork hats: per-loop-step (depth-pass) LoRA routing for looped archs
     void set_loop_adapters(llama_adapter_lora ** adapters, size_t n_adapters);

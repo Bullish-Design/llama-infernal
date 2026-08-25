@@ -2357,6 +2357,9 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
     for (int64_t t = 0; t < n_tokens; ++t) {
         // primary sequence id for this token routes to a pool adapter (or -1 = none)
         const llama_seq_id sid = ubatch->seq_id[t][0];
+        if (GGML_UNLIKELY(sid < 0 || (size_t) sid >= seq_adapter_map.size())) {
+            continue;
+        }
         const int32_t k = seq_adapter_map[sid];
         if (k >= 0 && k < n_adapters) {
             data[(size_t) k * n_tokens + t] = 1.0f; // layout [n_tokens, n_adapters]: column k contiguous

@@ -1018,7 +1018,11 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
-    state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    // Same guard as the final result: NONE (/completion) and OAI_CMPL
+    // (/v1/completions) never serialize the parsed chat message.
+    if (res_type != TASK_RESPONSE_TYPE_NONE && res_type != TASK_RESPONSE_TYPE_OAI_CMPL) {
+        state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    }
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;

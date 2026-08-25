@@ -1286,15 +1286,16 @@ void llama_context::set_seq_adapters(llama_adapter_lora ** adapters, size_t n_ad
     sched_need_reserve = true;
 }
 
-void llama_context::set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx) {
+int32_t llama_context::set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx) {
     if (seq_adapter_map.empty()) {
         seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
     }
     if (seq_id < 0 || (size_t) seq_id >= seq_adapter_map.size()) {
         LLAMA_LOG_ERROR("%s: seq_id %d out of range [0, %zu)\n", __func__, seq_id, seq_adapter_map.size());
-        return;
+        return -1;
     }
     seq_adapter_map[seq_id] = adapter_idx;
+    return 0;
 }
 
 void llama_context::set_loop_adapters(llama_adapter_lora ** adapters, size_t n_adapters) {
@@ -2390,6 +2391,17 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    // Each LoRA pair builds seven nodes per graph pass. Looped models build
+    // the same physical tensors once per loop, so their budget needs this factor.
+    const uint32_t n_loops = (uint32_t) model.loop_count();
+    uint32_t lora_nodes = 0;
+    for (const auto & lora : model.loras) {
+        lora_nodes += lora->get_n_nodes() * n_loops;
+    }
+    for (const auto & lora : seq_loras) {
+        lora_nodes += lora->get_n_nodes() * n_loops;
+    }
+
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -2398,12 +2410,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors()) + lora_nodes;
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    for (const auto & lora : model.loras) {
-        res += lora->get_n_nodes();
-    }
+    res += lora_nodes;
     return res;
 }
 
@@ -2487,6 +2497,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.seq_loras       =*/ &seq_loras,
         /*.seq_adapter_map =*/ seq_adapter_map.data(),
+        /*.n_seq_adapter_map =*/ (uint32_t) seq_adapter_map.size(),
         /*.loop_hat_map    =*/ loop_hat_map.empty() ? nullptr : &loop_hat_map,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
@@ -3916,9 +3927,7 @@ int32_t llama_set_seq_adapter(
             llama_context * ctx,
             llama_seq_id seq_id,
             int32_t adapter_idx) {
-    ctx->set_seq_adapter(seq_id, adapter_idx);
-
-    return 0;
+    return ctx->set_seq_adapter(seq_id, adapter_idx);
 }
 
 int32_t llama_set_loop_adapters(

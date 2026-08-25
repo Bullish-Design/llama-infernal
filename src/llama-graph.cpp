@@ -1426,6 +1426,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     seq_loras        (params.seq_loras),
     seq_adapter_map  (params.seq_adapter_map),
+    n_seq_adapter_map(params.n_seq_adapter_map),
     loop_hat_map     (params.loop_hat_map),
     mctx             (params.mctx),
     cross            (params.cross),
@@ -2387,6 +2388,12 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
     for (int64_t t = 0; t < n_tokens; ++t) {
         // primary sequence id for this token routes to a pool adapter (or -1 = none)
         const llama_seq_id sid = ubatch->seq_id[t][0];
+        // llama_set_seq_adapter rejects an out-of-range seq_id, but a caller can
+        // still put one in the ubatch. Bound the read: the map is sized
+        // n_seq_max, and sid indexes it directly.
+        if (sid < 0 || (uint32_t) sid >= n_seq_adapter_map) {
+            continue;
+        }
         const int32_t k = seq_adapter_map[sid];
         if (k >= 0 && k < n_adapters) {
             data[(size_t) k * n_tokens + t] = 1.0f; // layout [n_tokens, n_adapters]: column k contiguous
@@ -2398,7 +2405,7 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
 ggml_tensor * llm_graph_context::build_inp_seq_lora_mask() const {
     const int32_t n_adapters = (int32_t) seq_loras->size();
 
-    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_adapters);
+    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_seq_adapter_map, n_adapters);
 
     auto & cur = inp->mask;
 

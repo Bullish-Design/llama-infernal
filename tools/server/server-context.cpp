@@ -1411,17 +1411,33 @@ private:
                 cfg.node_budget_fixed = rc != 0;
             }
 
-            // R-3 and R-6 cannot be produced by this server: it has no hats
-            // surface, and cparams.n_seq_max is assigned from params.n_parallel.
-            // Both are defence in depth, so this hook is the only way to prove
-            // they fire rather than to read that they would.
+            // Three of the conditions cannot be produced by this server, so the
+            // two hooks below are the only way to prove that they fire rather
+            // than to read that they would.
+            //
+            // R-3: the server has no hats surface at all.
+            // R-6: cparams.n_seq_max is assigned from params.n_parallel.
+            // R-7: an alora needs an alora adapter this rig does not have.
+            // R-5 and W-2: an adapter that targets expert weights cannot load
+            //   against a dense model, so llama_adapter_lora_init rejects it
+            //   before the pool scan ever runs. TEST_SCAN feeds the path to the
+            //   shipped scanner instead. That is S11-P5's positive control.
             if (const char * force = getenv("LLAMA_SEQ_ROUTING_TEST_FORCE")) {
-                if (strcmp(force, "hats") == 0) {
+                const std::string f = force;
+                if (f.find("hats") != std::string::npos) {
                     cfg.hats_registered = true;
-                } else if (strcmp(force, "n_seq_max") == 0) {
+                }
+                if (f.find("n_seq_max") != std::string::npos) {
                     cfg.n_seq_max = cfg.n_parallel - 1;
                 }
+                if (f.find("alora") != std::string::npos && !cfg.pool.empty()) {
+                    cfg.pool[0].is_alora = true;
+                }
                 SRV_WRN("LLAMA_SEQ_ROUTING_TEST_FORCE = %s\n", force);
+            }
+            if (const char * scan = getenv("LLAMA_SEQ_ROUTING_TEST_SCAN")) {
+                cfg.pool.push_back(seq_routing_scan_adapter(scan, nullptr));
+                SRV_WRN("LLAMA_SEQ_ROUTING_TEST_SCAN = %s\n", scan);
             }
 
             const auto refusals = seq_routing_refusals(cfg);

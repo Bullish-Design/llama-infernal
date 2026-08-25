@@ -784,7 +784,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type");
+                // --spec-type is an enum toggle, not a last-wins value. --lora
+                // and --lora-scaled accumulate: their handlers push_back to
+                // params.lora_adapters, so "only the last value will be used"
+                // is false for them and the warning is misleading. Suppress it
+                // for those three; it stays for the last-wins arguments it
+                // actually describes.
+                const bool skip = (arg == "--spec-type" || arg == "--lora" || arg == "--lora-scaled");
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -1177,7 +1183,10 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
             throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
         }
         if (!seen_args.insert(arg).second) {
-            const bool skip = (arg == "--spec-type");
+            // Same accumulating-argument guard as common_params_parse above:
+            // --lora and --lora-scaled push_back, so the last-wins warning is
+            // false for them; --spec-type is an enum toggle.
+            const bool skip = (arg == "--spec-type" || arg == "--lora" || arg == "--lora-scaled");
 
             if (!skip) {
                 LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());

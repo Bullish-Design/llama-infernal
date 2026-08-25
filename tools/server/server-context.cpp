@@ -266,7 +266,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, this->lora);
         if (cur == nullptr) {
             return false;
         }
@@ -279,8 +279,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, lora_new);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1673,7 +1673,17 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // The incoming request's adapter set, computed with the same
+                // two-branch logic as launch_slot_with_task. A cached prompt may
+                // only serve a request under the adapters it was computed under.
+                std::vector<common_adapter_lora_info> task_loras;
+                if (!task.params.lora.empty()) {
+                    task_loras = construct_lora_list(task.params.lora);
+                } else {
+                    task_loras = params_base.lora_adapters;
+                }
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens, task_loras)) {
                     ret->prompt_clear();
                 }
 

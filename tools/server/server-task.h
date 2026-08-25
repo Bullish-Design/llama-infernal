@@ -619,6 +619,12 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // The adapter set the cached KV was computed under. The prompt-cache match
+    // elsewhere keys on tokens alone, so an entry must refuse to serve a request
+    // whose adapters differ — otherwise KV computed under one adapter restores
+    // into a request using another (005-server-seq-routing C.1).
+    std::vector<common_adapter_lora_info> lora;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -648,9 +654,11 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft,
+                                      const std::vector<common_adapter_lora_info> & lora);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              const std::vector<common_adapter_lora_info> & lora_new);
 
     void update();
 };

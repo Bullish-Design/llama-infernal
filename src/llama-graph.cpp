@@ -1424,8 +1424,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
-    seq_loras        (params.seq_loras),
-    seq_adapter_map  (params.seq_adapter_map),
+    seq_loras         (params.seq_loras),
+    seq_adapter_map   (params.seq_adapter_map),
+    seq_adapter_scale (params.seq_adapter_scale),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -2359,7 +2360,12 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
         const llama_seq_id sid = ubatch->seq_id[t][0];
         const int32_t k = seq_adapter_map[sid];
         if (k >= 0 && k < n_adapters) {
-            data[(size_t) k * n_tokens + t] = 1.0f; // layout [n_tokens, n_adapters]: column k contiguous
+            // the mask carries the per-sequence scale, not a 0/1 membership flag.
+            // it is multiplied in at build_lora_mm AFTER ggml_scale, so writing s
+            // here is exactly get_scale(alpha, 1.0f) * s. s == 1.0f is the default
+            // and is bit-identical to the original membership write.
+            const float s = seq_adapter_scale ? seq_adapter_scale[sid] : 1.0f;
+            data[(size_t) k * n_tokens + t] = s; // layout [n_tokens, n_adapters]: column k contiguous
         }
     }
     ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(float));
@@ -2368,7 +2374,7 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
 ggml_tensor * llm_graph_context::build_inp_seq_lora_mask() const {
     const int32_t n_adapters = (int32_t) seq_loras->size();
 
-    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_adapters);
+    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, seq_adapter_scale, n_adapters);
 
     auto & cur = inp->mask;
 

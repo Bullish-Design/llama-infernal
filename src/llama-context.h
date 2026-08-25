@@ -126,6 +126,7 @@ struct llama_context {
     // P2 fork: mixed-batch per-sequence LoRA routing
     void set_seq_adapters(llama_adapter_lora ** adapters, size_t n_adapters);
     void set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx);
+    void set_seq_adapter_scaled(llama_seq_id seq_id, int32_t adapter_idx, float scale);
 
     bool set_adapter_cvec(
             const float * data,
@@ -291,8 +292,13 @@ private:
     // P2 fork: mixed-batch per-sequence LoRA routing.
     // seq_loras: ordered adapter pool (index = routing id). seq_adapter_map:
     // per-seq_id adapter index (-1 = no adapter), sized LLAMA_MAX_SEQ.
+    // seq_adapter_scale: per-seq_id scale for the routed delta (default 1.0f),
+    // sized and written exactly where seq_adapter_map is. The scale reaches the
+    // graph through the mask (set_input, every decode), never through the pool,
+    // so changing it never forces a graph re-reserve.
     std::vector<llama_adapter_lora *> seq_loras;
     std::vector<int32_t>              seq_adapter_map;
+    std::vector<float>                seq_adapter_scale;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

@@ -169,15 +169,16 @@ public:
 // per-sequence (mixed-batch) LoRA routing mask (P2 fork)
 class llm_graph_input_seq_lora_mask : public llm_graph_input_i {
 public:
-    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, int32_t n_adapters)
-        : seq_adapter_map(seq_adapter_map), n_adapters(n_adapters) {}
+    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, const float * seq_adapter_scale, int32_t n_adapters)
+        : seq_adapter_map(seq_adapter_map), seq_adapter_scale(seq_adapter_scale), n_adapters(n_adapters) {}
     virtual ~llm_graph_input_seq_lora_mask() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = 1.0 where token's seq routes to adapter k
+    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = the seq's scale where token's seq routes to adapter k
 
     const int32_t * seq_adapter_map;
+    const float   * seq_adapter_scale; // per-seq_id scale; null = all 1.0
     const int32_t   n_adapters;
 };
 
@@ -746,6 +747,7 @@ struct llm_graph_params {
     // per-sequence (mixed-batch) LoRA routing: ordered adapter pool + seq->idx map
     const std::vector<llama_adapter_lora *> * seq_loras;
     const int32_t                           * seq_adapter_map;
+    const float                             * seq_adapter_scale;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -987,8 +989,9 @@ struct llm_graph_context {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     // per-sequence (mixed-batch) LoRA routing (P2 fork)
-    const std::vector<llama_adapter_lora *> * seq_loras        = nullptr;
-    const int32_t                           * seq_adapter_map  = nullptr;
+    const std::vector<llama_adapter_lora *> * seq_loras         = nullptr;
+    const int32_t                           * seq_adapter_map   = nullptr;
+    const float                             * seq_adapter_scale = nullptr; // per-seq_id scale; null = all 1.0
     mutable ggml_tensor                     * seq_lora_mask    = nullptr; // F32 [n_tokens, n_adapters], built lazily
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;

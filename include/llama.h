@@ -717,6 +717,17 @@ extern "C" {
             llama_seq_id seq_id,
             int32_t adapter_idx);
 
+    // As llama_set_seq_adapter, with a per-sequence scale. The scale multiplies
+    // the routed delta for this sequence only; scale 1.0f is identical to
+    // llama_set_seq_adapter, and scale 0.0f is identical to adapter_idx -1.
+    // The scale rides the per-decode mask, so two sequences may use one adapter
+    // at two scales inside a single llama_decode.
+    LLAMA_API int32_t llama_set_seq_adapter_scaled(
+            struct llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t adapter_idx,
+            float scale);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

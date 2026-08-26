@@ -169,13 +169,20 @@ public:
 // per-sequence (mixed-batch) LoRA routing mask (P2 fork)
 class llm_graph_input_seq_lora_mask : public llm_graph_input_i {
 public:
-    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, uint32_t n_seq_adapter_map, int32_t n_adapters, uint32_t n_outputs)
-        : seq_adapter_map(seq_adapter_map), n_seq_adapter_map(n_seq_adapter_map), n_adapters(n_adapters), n_outputs(n_outputs) {}
+    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, uint32_t n_seq_adapter_map,
+                                  const float * seq_adapter_scale,
+                                  std::vector<int32_t> pool_to_col, int32_t n_adapters,
+                                  uint32_t n_outputs)
+        : seq_adapter_map(seq_adapter_map), n_seq_adapter_map(n_seq_adapter_map),
+          seq_adapter_scale(seq_adapter_scale),
+          pool_to_col(std::move(pool_to_col)), n_adapters(n_adapters), n_outputs(n_outputs) {}
     virtual ~llm_graph_input_seq_lora_mask() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = 1.0 where token's seq routes to adapter k
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; one column per adapter IN FLIGHT
 
     // same routing over the rows inp_out_ids keeps. A model can narrow the
     // activations to n_outputs rows inside the layer loop and then run the FFN.
@@ -187,7 +194,14 @@ public:
     // entries in seq_adapter_map. The map arrives as a bare pointer, so its
     // length has to travel beside it; set_input needs it to bound the read.
     const uint32_t  n_seq_adapter_map;
-    const int32_t   n_adapters;
+    const float   * seq_adapter_scale; // per-seq_id scale; null = all 1.0
+    // pool index -> mask column, -1 for an adapter this graph does not carry.
+    // The graph is narrowed to the adapters in flight, so a pool index is no
+    // longer its own column. Built with the graph and fixed for its lifetime;
+    // allow_reuse refuses a graph whose active set differs, so it cannot go
+    // stale under reuse.
+    const std::vector<int32_t> pool_to_col;
+    const int32_t   n_adapters;      // == number of adapters in flight
     const uint32_t  n_outputs;
 };
 
@@ -757,6 +771,10 @@ struct llm_graph_params {
     const std::vector<llama_adapter_lora *> * seq_loras;
     const int32_t                           * seq_adapter_map;
     uint32_t                                  n_seq_adapter_map;
+    const float                             * seq_adapter_scale;
+    // pool indices this ubatch references, sorted. Narrowing the graph to it is
+    // what makes a decode cost adapters IN FLIGHT and not pool size.
+    std::vector<int32_t>                      seq_lora_active;
     // fork hats: per-loop-step LoRA routing (looped archs); null unless set
     const std::vector<int32_t>              * loop_hat_map;
     const llama_memory_context_i * mctx;
@@ -816,6 +834,13 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            return false;
+        }
+
+        // P2 fork: the graph is narrowed to the adapters in flight, so its
+        // topology depends on the active set. Reusing across a change would
+        // silently give a sequence another adapter's delta, or none.
+        if (seq_lora_active != other.seq_lora_active) {
             return false;
         }
 
@@ -1000,9 +1025,11 @@ struct llm_graph_context {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     // per-sequence (mixed-batch) LoRA routing (P2 fork)
-    const std::vector<llama_adapter_lora *> * seq_loras        = nullptr;
-    const int32_t                           * seq_adapter_map  = nullptr;
+    const std::vector<llama_adapter_lora *> * seq_loras         = nullptr;
+    const int32_t                           * seq_adapter_map   = nullptr;
     uint32_t                                  n_seq_adapter_map = 0;
+    const float                             * seq_adapter_scale = nullptr; // per-seq_id scale; null = all 1.0
+    std::vector<int32_t>                      seq_lora_active;             // pool indices in flight, sorted
     mutable ggml_tensor                     * seq_lora_mask     = nullptr; // F32 [n_tokens,  n_adapters], built lazily
     mutable ggml_tensor                     * seq_lora_mask_out = nullptr; // F32 [n_outputs, n_adapters], built lazily
     // the input object owning both masks; res owns it, this is a borrow so the

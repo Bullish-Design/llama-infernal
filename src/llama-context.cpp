@@ -12,9 +12,11 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1282,19 +1284,26 @@ void llama_context::set_seq_adapters(llama_adapter_lora ** adapters, size_t n_ad
     seq_loras.assign(adapters, adapters + n_adapters);
     if (seq_adapter_map.empty()) {
         seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
+        seq_adapter_scale.assign((size_t) cparams.n_seq_max, 1.0f);
     }
     sched_need_reserve = true;
 }
 
 int32_t llama_context::set_seq_adapter(llama_seq_id seq_id, int32_t adapter_idx) {
+    return set_seq_adapter_scaled(seq_id, adapter_idx, 1.0f);
+}
+
+int32_t llama_context::set_seq_adapter_scaled(llama_seq_id seq_id, int32_t adapter_idx, float scale) {
     if (seq_adapter_map.empty()) {
         seq_adapter_map.assign((size_t) cparams.n_seq_max, -1);
+        seq_adapter_scale.assign((size_t) cparams.n_seq_max, 1.0f);
     }
     if (seq_id < 0 || (size_t) seq_id >= seq_adapter_map.size()) {
         LLAMA_LOG_ERROR("%s: seq_id %d out of range [0, %zu)\n", __func__, seq_id, seq_adapter_map.size());
         return -1;
     }
-    seq_adapter_map[seq_id] = adapter_idx;
+    seq_adapter_map  [seq_id] = adapter_idx;
+    seq_adapter_scale[seq_id] = scale;
     return 0;
 }
 
@@ -2456,7 +2465,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), /*reserve =*/ true);
 
     res->reset();
 
@@ -2480,11 +2489,54 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+// P2 fork: the pool indices this ubatch's sequences actually reference, sorted.
+// build_lora_mm emits one unfused delta per entry, so narrowing this list is
+// what makes a decode cost the adapters IN FLIGHT and not the pool size.
+//
+// A reserve pass must take the whole pool instead: the reserved graph has to be
+// a superset of every graph a later decode can build, or the first wider decode
+// pays a reallocation.
+std::vector<int32_t> llama_context::seq_lora_active(const llama_ubatch & ubatch, bool reserve) const {
+    std::vector<int32_t> active;
+
+    if (seq_loras.empty()) {
+        return active;
+    }
+
+    if (reserve) {
+        active.resize(seq_loras.size());
+        std::iota(active.begin(), active.end(), 0);
+        return active;
+    }
+
+    for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+        if (ubatch.seq_id == nullptr || ubatch.seq_id[t] == nullptr) {
+            continue;
+        }
+        const llama_seq_id sid = ubatch.seq_id[t][0];
+        if (sid < 0 || (size_t) sid >= seq_adapter_map.size()) {
+            continue;
+        }
+        const int32_t k = seq_adapter_map[sid];
+        if (k < 0 || (size_t) k >= seq_loras.size()) {
+            continue;
+        }
+        if (std::find(active.begin(), active.end(), k) == active.end()) {
+            active.push_back(k);
+        }
+    }
+
+    std::sort(active.begin(), active.end());
+
+    return active;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                    bool   reserve) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2498,6 +2550,8 @@ llm_graph_params llama_context::graph_params(
         /*.seq_loras       =*/ &seq_loras,
         /*.seq_adapter_map =*/ seq_adapter_map.data(),
         /*.n_seq_adapter_map =*/ (uint32_t) seq_adapter_map.size(),
+        /*.seq_adapter_scale =*/ seq_adapter_scale.data(),
+        /*.seq_lora_active =*/ seq_lora_active(ubatch, reserve),
         /*.loop_hat_map    =*/ loop_hat_map.empty() ? nullptr : &loop_hat_map,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
@@ -3950,6 +4004,14 @@ int32_t llama_set_loop_adapter(
     ctx->set_loop_adapter(loop_step, adapter_idx);
 
     return 0;
+}
+
+int32_t llama_set_seq_adapter_scaled(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            int32_t adapter_idx,
+            float scale) {
+    return ctx->set_seq_adapter_scaled(seq_id, adapter_idx, scale);
 }
 
 int32_t llama_set_adapter_cvec(

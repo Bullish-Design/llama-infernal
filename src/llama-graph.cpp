@@ -1424,10 +1424,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
-    seq_loras        (params.seq_loras),
-    seq_adapter_map  (params.seq_adapter_map),
-    n_seq_adapter_map(params.n_seq_adapter_map),
-    loop_hat_map     (params.loop_hat_map),
+    seq_loras         (params.seq_loras),
+    seq_adapter_map   (params.seq_adapter_map),
+    n_seq_adapter_map (params.n_seq_adapter_map),
+    seq_adapter_scale (params.seq_adapter_scale),
+    seq_lora_active   (params.seq_lora_active),
+    loop_hat_map      (params.loop_hat_map),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1495,14 +1497,23 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     // its own sequence's adapter. Correctness-first (unfused): compute every pool
     // adapter's delta over all tokens and mask it to the tokens that selected it.
     if (seq_loras != nullptr && !seq_loras->empty()) {
-        // Nothing to mask when no pooled adapter carries a weight for w, and
-        // the check has to come BEFORE the mask is built. build_lora_mm runs
-        // for every tensor in the model, most of which no adapter targets; a
-        // mask built there is consumed by no node, so the allocator gives it no
+        // Narrowed to the adapters in flight: a registered adapter no sequence
+        // in this ubatch routes to contributes a column of zeros and an exact
+        // no-op, so emitting it is pure cost. seq_lora_active is part of
+        // llm_graph_params::allow_reuse, so a graph built for one active set is
+        // never reused for another.
+        if (seq_lora_active.empty()) {
+            return res;
+        }
+
+        // Nothing to mask when no adapter in flight carries a weight for w, and
+        // the check has to come BEFORE the mask is built. build_lora_mm runs for
+        // every tensor in the model, most of which no adapter targets; a mask
+        // built there is consumed by no node, so the allocator gives it no
         // buffer and set_input writes to nothing (ggml-backend.cpp:327).
         bool targeted = false;
-        for (int32_t k = 0; !targeted && k < (int32_t) seq_loras->size(); ++k) {
-            targeted = (*seq_loras)[k]->get_weight(w) != nullptr;
+        for (int32_t c = 0; !targeted && c < (int32_t) seq_lora_active.size(); ++c) {
+            targeted = (*seq_loras)[seq_lora_active[c]]->get_weight(w) != nullptr;
         }
         if (!targeted) {
             return res;
@@ -1520,7 +1531,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
         ggml_tensor * mask = build_inp_seq_lora_mask(n_rows);
 
-        for (int32_t k = 0; k < (int32_t) seq_loras->size(); ++k) {
+        for (int32_t c = 0; c < (int32_t) seq_lora_active.size(); ++c) {
+            const int32_t k = seq_lora_active[c];
             llama_adapter_lora * ad = (*seq_loras)[k];
             llama_adapter_lora_weight * lw = ad->get_weight(w);
             if (lw == nullptr) {
@@ -1534,7 +1546,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             ab_cur = ggml_scale(ctx0, ab_cur, scale);
             // per-token membership for adapter k: contiguous column -> [1, n_rows]
             ggml_tensor * mcol = ggml_view_1d(ctx0, mask, n_rows,
-                    (size_t) k * n_rows * ggml_element_size(mask));
+                    (size_t) c * n_rows * ggml_element_size(mask));
             mcol = ggml_reshape_2d(ctx0, mcol, 1, n_rows);
             ab_cur = ggml_mul(ctx0, ab_cur, mcol); // broadcast [1,n_rows] over [out,n_rows]
             res = ggml_add(ctx0, res, ab_cur);
@@ -2420,8 +2432,17 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
             continue;
         }
         const int32_t k = seq_adapter_map[sid];
-        if (k >= 0 && k < n_adapters) {
-            data[(size_t) k * n_tokens + t] = 1.0f; // layout [n_tokens, n_adapters]: column k contiguous
+        // pool index -> this graph's column. -1 means the graph does not carry
+        // that adapter, which cannot happen while the active set matches, and
+        // is skipped rather than trusted if it ever does.
+        const int32_t c = (k >= 0 && (size_t) k < pool_to_col.size()) ? pool_to_col[k] : -1;
+        if (c >= 0 && c < n_adapters) {
+            // the mask carries the per-sequence scale, not a 0/1 membership flag.
+            // it is multiplied in at build_lora_mm AFTER ggml_scale, so writing s
+            // here is exactly get_scale(alpha, 1.0f) * s. s == 1.0f is the default
+            // and is bit-identical to the original membership write.
+            const float s = seq_adapter_scale ? seq_adapter_scale[sid] : 1.0f;
+            data[(size_t) c * n_tokens + t] = s; // layout [n_tokens, n_adapters]: column c contiguous
         }
     }
     if (mask != nullptr) {
@@ -2458,6 +2479,46 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(mask_out, data_out.data(), 0, data_out.size() * sizeof(float));
 }
 
+bool llm_graph_input_seq_lora_mask::can_reuse(const llm_graph_params & params) {
+    // set_input rewrites the mask on every decode, reused graph or not, so this
+    // only has to answer whether the TOPOLOGY still holds: the tensor's shape,
+    // and the pool index -> column mapping the graph was built around.
+    //
+    // Without this the base returns false, so every graph carrying a routing
+    // mask was rebuilt on every decode step. Measured before it: 1 graph reused
+    // in 845 decode steps.
+    bool res = true;
+
+    // A graph carrying this input built at least one mask; which ones depends
+    // on where the adapters land relative to the last layer's row reduction.
+    res &= mask != nullptr || mask_out != nullptr;
+    res &= (int32_t) params.seq_lora_active.size() == n_adapters;
+
+    // n_outputs is topology now: build_lora_mm picks between the two masks by
+    // row count, and the reduced one is sized by it. A graph built at one
+    // n_outputs must never serve another.
+    res &= n_outputs == params.n_outputs;
+
+    if (res && mask != nullptr) {
+        res &= mask->ne[0] == params.ubatch.n_tokens;
+        res &= mask->ne[1] == n_adapters;
+    }
+
+    if (res && mask_out != nullptr) {
+        res &= mask_out->ne[0] == (int64_t) params.n_outputs;
+        res &= mask_out->ne[1] == n_adapters;
+    }
+
+    // An equal active set gives an equal mapping, but check it rather than
+    // derive it: a wrong column here is another sequence's adapter, silently.
+    for (int32_t c = 0; res && c < n_adapters; ++c) {
+        const int32_t k = params.seq_lora_active[c];
+        res &= k >= 0 && (size_t) k < pool_to_col.size() && pool_to_col[k] == c;
+    }
+
+    return res;
+}
+
 // Both masks are built on first use, and only the one a caller asks for. The
 // allocator gives no buffer to a tensor no node consumes, and set_input would
 // then write to nothing (ggml-backend.cpp:327). Either can therefore be absent:
@@ -2466,9 +2527,16 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
 // the common case.
 ggml_tensor * llm_graph_context::build_inp_seq_lora_mask(int64_t n_rows) const {
     if (seq_lora_mask_inp == nullptr) {
-        const int32_t n_adapters = (int32_t) seq_loras->size();
+        const int32_t n_adapters = (int32_t) seq_lora_active.size();
 
-        auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_seq_adapter_map, n_adapters, n_outputs);
+        std::vector<int32_t> pool_to_col(seq_loras->size(), -1);
+        for (int32_t c = 0; c < n_adapters; ++c) {
+            pool_to_col[seq_lora_active[c]] = c;
+        }
+
+        auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(
+                seq_adapter_map, n_seq_adapter_map, seq_adapter_scale,
+                std::move(pool_to_col), n_adapters, n_outputs);
 
         // borrow before the move; res owns the input for the graph's lifetime
         seq_lora_mask_inp = inp.get();

@@ -2422,6 +2422,34 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(float));
 }
 
+bool llm_graph_input_seq_lora_mask::can_reuse(const llm_graph_params & params) {
+    // set_input rewrites the mask on every decode, reused graph or not, so this
+    // only has to answer whether the TOPOLOGY still holds: the tensor's shape,
+    // and the pool index -> column mapping the graph was built around.
+    //
+    // Without this the base returns false, so every graph carrying a routing
+    // mask was rebuilt on every decode step. Measured before it: 1 graph reused
+    // in 845 decode steps.
+    bool res = true;
+
+    res &= mask != nullptr;
+    res &= (int32_t) params.seq_lora_active.size() == n_adapters;
+
+    if (res) {
+        res &= mask->ne[0] == params.ubatch.n_tokens;
+        res &= mask->ne[1] == n_adapters;
+    }
+
+    // An equal active set gives an equal mapping, but check it rather than
+    // derive it: a wrong column here is another sequence's adapter, silently.
+    for (int32_t c = 0; res && c < n_adapters; ++c) {
+        const int32_t k = params.seq_lora_active[c];
+        res &= k >= 0 && (size_t) k < pool_to_col.size() && pool_to_col[k] == c;
+    }
+
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_inp_seq_lora_mask() const {
     const int32_t n_adapters = (int32_t) seq_lora_active.size();
 

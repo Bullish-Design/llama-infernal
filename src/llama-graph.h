@@ -179,6 +179,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; one column per adapter IN FLIGHT
 
     const int32_t * seq_adapter_map;

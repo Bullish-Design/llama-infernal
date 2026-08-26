@@ -33,6 +33,7 @@ struct seq_routing_api {
 struct seq_routing_adapter {
     std::string path;
     size_t      n_pairs  = 0;     // LoRA A/B pairs, named by W-2
+    size_t      n_bytes  = 0;     // W-4: tensor data, summed from the GGUF
     bool        is_alora = false; // R-7
     std::string moe_tensor;       // R-5: first expert weight this adapter targets, empty when clean
     bool        gguf_ok  = false; // false = the GGUF could not be read
@@ -57,6 +58,11 @@ struct seq_routing_config {
     std::string slot_save_path;                  // R-4
     bool        has_draft_model  = false;        // W-3
 
+    // device memory, W-4. Both 0 = unknown (no offload device, or the backend
+    // could not be asked); W-4 then falls back and says so.
+    size_t   vram_free_bytes  = 0;
+    size_t   vram_total_bytes = 0;
+
     std::vector<seq_routing_adapter> pool;
 };
 
@@ -74,6 +80,32 @@ int32_t seq_routing_pool_ceiling(uint32_t n_ubatch, int32_t n_tensors);
 
 // Smallest --batch-size that admits a pool of n_pool on an unfixed library.
 uint32_t seq_routing_batch_size_for(int32_t n_pool);
+
+// W-4's pool bound, computed from device memory rather than from a constant.
+//
+// D3 capped the pool at 3 from S8's throughput decay. Stage 6A removed the
+// decay (pool 8 is 1.01x pool 2 at one adapter in flight) and 08 removed the
+// node ceiling, so the remaining bound is VRAM for the adapter weights.
+//
+// The pool is ALREADY RESIDENT when this runs: common_init_from_params loads
+// every --lora before the routing config is built. So this is a headroom
+// report, not a pre-flight check - a pool too large to load fails inside the
+// loader, loudly, before any of this. What it answers is "how close to the edge
+// is this server, and how many more adapters would fit".
+struct seq_routing_vram_cap {
+    bool    known             = false; // false = no device memory figure; W-4 falls back
+    size_t  pool_bytes        = 0;     // adapter tensor data, summed from the GGUFs
+    size_t  per_adapter_bytes = 0;     // mean over the pool, with the margin applied
+    size_t  free_bytes        = 0;
+    int32_t headroom          = 0;     // further adapters that fit in free_bytes
+    int32_t cap               = 0;     // pool size + headroom
+};
+
+seq_routing_vram_cap seq_routing_pool_vram_cap(const seq_routing_config & cfg);
+
+// Free and total memory of the first offload device, for W-4. Sets both to 0
+// when there is no such device, which is the CPU-only case and not an error.
+void seq_routing_device_memory(size_t * free_bytes, size_t * total_bytes);
 
 // R-1 to R-7. An empty result means the server may start.
 std::vector<seq_routing_finding> seq_routing_refusals(const seq_routing_config & cfg);

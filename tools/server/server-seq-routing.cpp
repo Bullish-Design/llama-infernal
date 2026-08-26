@@ -1,6 +1,7 @@
 #include "server-seq-routing.h"
 
 #include "common.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -111,6 +112,11 @@ seq_routing_adapter seq_routing_scan_adapter(const std::string & path, const lla
             out.n_pairs++;
         }
 
+        // W-4. The tensor data is what lands in VRAM; the GGUF's key-value
+        // header does not. Summing the tensors is therefore closer than the
+        // file size, and it is exact.
+        out.n_bytes += gguf_get_tensor_size(gc, i);
+
         if (out.moe_tensor.empty()) {
             for (const char * frag : MOE_TENSOR_FRAGMENTS) {
                 if (name.find(frag) != std::string::npos) {
@@ -124,6 +130,82 @@ seq_routing_adapter seq_routing_scan_adapter(const std::string & path, const lla
     gguf_free(gc);
 
     return out;
+}
+
+// An adapter costs more VRAM than its tensors: the graph widens with it, and
+// the compute buffers grow. Measured 2026-08-26 on two models at -c 16384
+// --parallel 8, as (VRAM slope per adapter) / (adapter tensor bytes):
+//
+//   Nanbeige4.2-3B  45.74 MiB of tensors -> 54.41 MiB per adapter   1.19x
+//   Ornith-1.0-9B   55.52 MiB of tensors -> 59.29 MiB per adapter   1.07x
+//
+// Neither a constant ratio nor a constant excess fits both, and two models
+// cannot tell which, so the excess is NOT modelled. This margin covers both
+// observations with room. It is deliberately loose: over-estimating the cost
+// makes W-4 fire early, which is the safe direction for a warning.
+static const size_t SEQ_ROUTING_VRAM_MARGIN_NUM = 5;
+static const size_t SEQ_ROUTING_VRAM_MARGIN_DEN = 4;   // 1.25x
+
+// Fire W-4 when fewer than this many further adapters would fit.
+static const int32_t SEQ_ROUTING_VRAM_WARN_HEADROOM = 2;
+
+void seq_routing_device_memory(size_t * free_bytes, size_t * total_bytes) {
+    *free_bytes  = 0;
+    *total_bytes = 0;
+
+    // The first GPU device. A multi-device split would need the model's own
+    // device list, which llama.h does not expose; this rig runs one card per
+    // server, and W-4 says "could not be computed" rather than guess if that
+    // ever stops being true.
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        ggml_backend_dev_memory(dev, free_bytes, total_bytes);
+        return;
+    }
+}
+
+seq_routing_vram_cap seq_routing_pool_vram_cap(const seq_routing_config & cfg) {
+    seq_routing_vram_cap out;
+
+    if (cfg.pool.empty()) {
+        return out;
+    }
+
+    size_t total   = 0;
+    size_t n_sized = 0;
+    for (const auto & a : cfg.pool) {
+        if (a.gguf_ok && a.n_bytes > 0) {
+            total += a.n_bytes;
+            n_sized++;
+        }
+    }
+
+    // Fail-closed: an unreadable GGUF or a device that cannot be asked leaves
+    // `known` false, and W-4 says which one rather than inventing a number.
+    if (n_sized != cfg.pool.size() || cfg.vram_free_bytes == 0) {
+        out.pool_bytes = total;
+        return out;
+    }
+
+    out.known             = true;
+    out.pool_bytes        = total;
+    out.free_bytes        = cfg.vram_free_bytes;
+    out.per_adapter_bytes = (total / n_sized) * SEQ_ROUTING_VRAM_MARGIN_NUM / SEQ_ROUTING_VRAM_MARGIN_DEN;
+
+    if (out.per_adapter_bytes > 0) {
+        out.headroom = (int32_t) (cfg.vram_free_bytes / out.per_adapter_bytes);
+    }
+    out.cap = (int32_t) cfg.pool.size() + out.headroom;
+
+    return out;
+}
+
+static std::string mib(size_t bytes) {
+    return string_format("%zu MiB", bytes / (1024 * 1024));
 }
 
 std::vector<seq_routing_finding> seq_routing_refusals(const seq_routing_config & cfg) {
@@ -288,18 +370,35 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
             "your acceptance rate before keeping this on." });
     }
 
-    // W-4 [S8, and stage 6A]. D3 capped the pool at 3 because the graph was
-    // built over every REGISTERED adapter, so pool 8 cost 1.80x pool 2 whatever
-    // was in flight. The graph is now built over the adapters in flight, and
-    // the same comparison measures 1.01x. The cap is no longer cost-driven, so
-    // this warns about memory rather than about throughput.
-    if (cfg.pool.size() > 3) {
+    // W-4 [S8, stage 6A, and 18/19]. D3 capped the pool at 3 because the graph
+    // was built over every REGISTERED adapter, so pool 8 cost 1.80x pool 2
+    // whatever was in flight. Stage 6A builds the graph over the adapters in
+    // flight and the same comparison measures 1.01x; 08 removed the node
+    // ceiling. The bound left is VRAM, so the threshold is now computed from
+    // the device instead of being the constant 3.
+    const seq_routing_vram_cap vram = seq_routing_pool_vram_cap(cfg);
+
+    if (vram.known) {
+        if (vram.headroom < SEQ_ROUTING_VRAM_WARN_HEADROOM) {
+            out.push_back({ "W-4", string_format(
+                "--lora-seq-routing: pool of %d holds %s of adapter weights, and the device has %s free - "
+                "room for about %d more at %s each. Registered adapters no longer cost throughput (pool 8 is "
+                "1.01x pool 2 per decode step), so size the pool for memory. Past the device the loader fails "
+                "outright, not this warning.",
+                (int32_t) cfg.pool.size(), mib(vram.pool_bytes).c_str(), mib(vram.free_bytes).c_str(),
+                vram.headroom, mib(vram.per_adapter_bytes).c_str()) });
+        }
+    } else if (cfg.pool.size() > 3) {
+        // No device figure, so no computed bound. Fall back to D3's constant
+        // and SAY the fallback fired - a missing capability is never a silent
+        // pass. Reached on a CPU-only server, or when an adapter GGUF could not
+        // be sized.
         out.push_back({ "W-4", string_format(
-            "--lora-seq-routing: pool of %d. Registered adapters no longer cost throughput - pool 8 is 1.01x "
-            "pool 2 per decode step at the same traffic - but each one still holds its weights in VRAM and "
-            "widens the graph node budget. Size the pool for memory, and expect no gain from adapters no "
-            "request names.",
-            (int32_t) cfg.pool.size()) });
+            "--lora-seq-routing: pool of %d, and the adapter VRAM cost could not be computed (%s). Falling "
+            "back to D3's constant of 3. Registered adapters no longer cost throughput - pool 8 is 1.01x "
+            "pool 2 per decode step - but each one holds its weights in memory, so size the pool for it.",
+            (int32_t) cfg.pool.size(),
+            cfg.vram_free_bytes == 0 ? "no offload device reported free memory" : "an adapter GGUF could not be sized") });
     }
 
     return out;

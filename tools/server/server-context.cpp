@@ -1402,6 +1402,10 @@ private:
                 cfg.pool.push_back(seq_routing_scan_adapter(la.path, la.ptr));
             }
 
+            // W-4's bound. Read AFTER the model and the pool are resident, so
+            // "free" is what is left over, not what the device started with.
+            seq_routing_device_memory(&cfg.vram_free_bytes, &cfg.vram_total_bytes);
+
             // R-2 probes the library instead of assuming it. A library carrying
             // the stage 0.5 node-budget fix returns -1 for an out-of-range
             // seq_id and has no pool ceiling; an unfixed one returns 0 and
@@ -1432,6 +1436,21 @@ private:
                 }
                 if (f.find("alora") != std::string::npos && !cfg.pool.empty()) {
                     cfg.pool[0].is_alora = true;
+                }
+                // W-4's low-headroom state. Producing it for real means filling
+                // a card to within two adapters of full, which this rig cannot
+                // do reproducibly - the same reason hats and n_seq_max are
+                // forced above. One adapter's worth of free memory puts the
+                // headroom at 0 and fires the warning.
+                if (f.find("vram_tight") != std::string::npos && !cfg.pool.empty()) {
+                    cfg.vram_free_bytes = cfg.pool[0].n_bytes;
+                }
+                // The other side of W-4: no device figure at all, which is the
+                // CPU-only server, and must fall back to D3's constant rather
+                // than pass in silence.
+                if (f.find("vram_unknown") != std::string::npos) {
+                    cfg.vram_free_bytes  = 0;
+                    cfg.vram_total_bytes = 0;
                 }
                 SRV_WRN("LLAMA_SEQ_ROUTING_TEST_FORCE = %s\n", force);
             }
@@ -1465,8 +1484,22 @@ private:
 
             seq_routing_enabled = true;
 
-            SRV_INF("--lora-seq-routing: pool of %d adapters registered, library node budget %s\n",
-                    (int32_t) seq_pool.size(), cfg.node_budget_fixed ? "fixed" : "UNFIXED");
+            // The computed pool bound is reported on every start, not only when
+            // W-4 fires. A warning that stays silent is indistinguishable from
+            // one that was never computed, and this is the number an operator
+            // sizes the pool with.
+            const seq_routing_vram_cap vram = seq_routing_pool_vram_cap(cfg);
+            if (vram.known) {
+                SRV_INF("--lora-seq-routing: pool of %d adapters registered, library node budget %s, "
+                        "adapter VRAM %zu MiB used / %zu MiB free -> room for about %d more (cap %d)\n",
+                        (int32_t) seq_pool.size(), cfg.node_budget_fixed ? "fixed" : "UNFIXED",
+                        vram.pool_bytes / (1024 * 1024), vram.free_bytes / (1024 * 1024),
+                        vram.headroom, vram.cap);
+            } else {
+                SRV_INF("--lora-seq-routing: pool of %d adapters registered, library node budget %s, "
+                        "adapter VRAM cost not computable\n",
+                        (int32_t) seq_pool.size(), cfg.node_budget_fixed ? "fixed" : "UNFIXED");
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {

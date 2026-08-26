@@ -12,9 +12,11 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -2432,7 +2434,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), /*reserve =*/ true);
 
     res->reset();
 
@@ -2456,11 +2458,54 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+// P2 fork: the pool indices this ubatch's sequences actually reference, sorted.
+// build_lora_mm emits one unfused delta per entry, so narrowing this list is
+// what makes a decode cost the adapters IN FLIGHT and not the pool size.
+//
+// A reserve pass must take the whole pool instead: the reserved graph has to be
+// a superset of every graph a later decode can build, or the first wider decode
+// pays a reallocation.
+std::vector<int32_t> llama_context::seq_lora_active(const llama_ubatch & ubatch, bool reserve) const {
+    std::vector<int32_t> active;
+
+    if (seq_loras.empty()) {
+        return active;
+    }
+
+    if (reserve) {
+        active.resize(seq_loras.size());
+        std::iota(active.begin(), active.end(), 0);
+        return active;
+    }
+
+    for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+        if (ubatch.seq_id == nullptr || ubatch.seq_id[t] == nullptr) {
+            continue;
+        }
+        const llama_seq_id sid = ubatch.seq_id[t][0];
+        if (sid < 0 || (size_t) sid >= seq_adapter_map.size()) {
+            continue;
+        }
+        const int32_t k = seq_adapter_map[sid];
+        if (k < 0 || (size_t) k >= seq_loras.size()) {
+            continue;
+        }
+        if (std::find(active.begin(), active.end(), k) == active.end()) {
+            active.push_back(k);
+        }
+    }
+
+    std::sort(active.begin(), active.end());
+
+    return active;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                    bool   reserve) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2474,6 +2519,7 @@ llm_graph_params llama_context::graph_params(
         /*.seq_loras       =*/ &seq_loras,
         /*.seq_adapter_map =*/ seq_adapter_map.data(),
         /*.seq_adapter_scale =*/ seq_adapter_scale.data(),
+        /*.seq_lora_active =*/ seq_lora_active(ubatch, reserve),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,

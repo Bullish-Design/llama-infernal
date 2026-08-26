@@ -1427,6 +1427,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     seq_loras         (params.seq_loras),
     seq_adapter_map   (params.seq_adapter_map),
     seq_adapter_scale (params.seq_adapter_scale),
+    seq_lora_active   (params.seq_lora_active),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1465,10 +1466,19 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     // its own sequence's adapter. Correctness-first (unfused): compute every pool
     // adapter's delta over all tokens and mask it to the tokens that selected it.
     if (seq_loras != nullptr && !seq_loras->empty()) {
+        // Narrowed to the adapters in flight: a registered adapter no sequence
+        // in this ubatch routes to contributes a column of zeros and an exact
+        // no-op, so emitting it is pure cost. seq_lora_active is part of
+        // llm_graph_params::allow_reuse, so a graph built for one active set is
+        // never reused for another.
+        if (seq_lora_active.empty()) {
+            return res;
+        }
         if (seq_lora_mask == nullptr) {
             build_inp_seq_lora_mask();
         }
-        for (int32_t k = 0; k < (int32_t) seq_loras->size(); ++k) {
+        for (int32_t c = 0; c < (int32_t) seq_lora_active.size(); ++c) {
+            const int32_t k = seq_lora_active[c];
             llama_adapter_lora * ad = (*seq_loras)[k];
             llama_adapter_lora_weight * lw = ad->get_weight(w);
             if (lw == nullptr) {
@@ -1482,7 +1492,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             ab_cur = ggml_scale(ctx0, ab_cur, scale);
             // per-token membership for adapter k: contiguous column -> [1, n_tokens]
             ggml_tensor * mcol = ggml_view_1d(ctx0, seq_lora_mask, n_tokens,
-                    (size_t) k * n_tokens * ggml_element_size(seq_lora_mask));
+                    (size_t) c * n_tokens * ggml_element_size(seq_lora_mask));
             mcol = ggml_reshape_2d(ctx0, mcol, 1, n_tokens);
             ab_cur = ggml_mul(ctx0, ab_cur, mcol); // broadcast [1,n_tokens] over [out,n_tokens]
             res = ggml_add(ctx0, res, ab_cur);
@@ -2359,22 +2369,32 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
         // primary sequence id for this token routes to a pool adapter (or -1 = none)
         const llama_seq_id sid = ubatch->seq_id[t][0];
         const int32_t k = seq_adapter_map[sid];
-        if (k >= 0 && k < n_adapters) {
+        // pool index -> this graph's column. -1 means the graph does not carry
+        // that adapter, which cannot happen while the active set matches, and
+        // is skipped rather than trusted if it ever does.
+        const int32_t c = (k >= 0 && (size_t) k < pool_to_col.size()) ? pool_to_col[k] : -1;
+        if (c >= 0 && c < n_adapters) {
             // the mask carries the per-sequence scale, not a 0/1 membership flag.
             // it is multiplied in at build_lora_mm AFTER ggml_scale, so writing s
             // here is exactly get_scale(alpha, 1.0f) * s. s == 1.0f is the default
             // and is bit-identical to the original membership write.
             const float s = seq_adapter_scale ? seq_adapter_scale[sid] : 1.0f;
-            data[(size_t) k * n_tokens + t] = s; // layout [n_tokens, n_adapters]: column k contiguous
+            data[(size_t) c * n_tokens + t] = s; // layout [n_tokens, n_adapters]: column c contiguous
         }
     }
     ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(float));
 }
 
 ggml_tensor * llm_graph_context::build_inp_seq_lora_mask() const {
-    const int32_t n_adapters = (int32_t) seq_loras->size();
+    const int32_t n_adapters = (int32_t) seq_lora_active.size();
 
-    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, seq_adapter_scale, n_adapters);
+    std::vector<int32_t> pool_to_col(seq_loras->size(), -1);
+    for (int32_t c = 0; c < n_adapters; ++c) {
+        pool_to_col[seq_lora_active[c]] = c;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(
+            seq_adapter_map, seq_adapter_scale, std::move(pool_to_col), n_adapters);
 
     auto & cur = inp->mask;
 

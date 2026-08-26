@@ -169,17 +169,25 @@ public:
 // per-sequence (mixed-batch) LoRA routing mask (P2 fork)
 class llm_graph_input_seq_lora_mask : public llm_graph_input_i {
 public:
-    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, const float * seq_adapter_scale, int32_t n_adapters)
-        : seq_adapter_map(seq_adapter_map), seq_adapter_scale(seq_adapter_scale), n_adapters(n_adapters) {}
+    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, const float * seq_adapter_scale,
+                                  std::vector<int32_t> pool_to_col, int32_t n_adapters)
+        : seq_adapter_map(seq_adapter_map), seq_adapter_scale(seq_adapter_scale),
+          pool_to_col(std::move(pool_to_col)), n_adapters(n_adapters) {}
     virtual ~llm_graph_input_seq_lora_mask() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = the seq's scale where token's seq routes to adapter k
+    ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; one column per adapter IN FLIGHT
 
     const int32_t * seq_adapter_map;
     const float   * seq_adapter_scale; // per-seq_id scale; null = all 1.0
-    const int32_t   n_adapters;
+    // pool index -> mask column, -1 for an adapter this graph does not carry.
+    // The graph is narrowed to the adapters in flight, so a pool index is no
+    // longer its own column. Built with the graph and fixed for its lifetime;
+    // allow_reuse refuses a graph whose active set differs, so it cannot go
+    // stale under reuse.
+    const std::vector<int32_t> pool_to_col;
+    const int32_t   n_adapters;      // == number of adapters in flight
 };
 
 // temperature tuning, used by llama4
@@ -748,6 +756,9 @@ struct llm_graph_params {
     const std::vector<llama_adapter_lora *> * seq_loras;
     const int32_t                           * seq_adapter_map;
     const float                             * seq_adapter_scale;
+    // pool indices this ubatch references, sorted. Narrowing the graph to it is
+    // what makes a decode cost adapters IN FLIGHT and not pool size.
+    std::vector<int32_t>                      seq_lora_active;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -805,6 +816,13 @@ struct llm_graph_params {
         }
 
         if (!can_reuse_ubatch) {
+            return false;
+        }
+
+        // P2 fork: the graph is narrowed to the adapters in flight, so its
+        // topology depends on the active set. Reusing across a change would
+        // silently give a sequence another adapter's delta, or none.
+        if (seq_lora_active != other.seq_lora_active) {
             return false;
         }
 
@@ -992,6 +1010,7 @@ struct llm_graph_context {
     const std::vector<llama_adapter_lora *> * seq_loras         = nullptr;
     const int32_t                           * seq_adapter_map   = nullptr;
     const float                             * seq_adapter_scale = nullptr; // per-seq_id scale; null = all 1.0
+    std::vector<int32_t>                      seq_lora_active;             // pool indices in flight, sorted
     mutable ggml_tensor                     * seq_lora_mask    = nullptr; // F32 [n_tokens, n_adapters], built lazily
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;

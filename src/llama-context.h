@@ -263,7 +263,13 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                    bool   reserve = false) const;
+
+    // P2 fork: pool indices this ubatch's sequences reference, sorted. A
+    // reserve pass takes the whole pool, so the reserved graph stays a superset
+    // of every graph a decode can build.
+    std::vector<int32_t> seq_lora_active(const llama_ubatch & ubatch, bool reserve) const;
 
     llm_graph_cb graph_get_cb() const;
 

@@ -169,16 +169,23 @@ public:
 // per-sequence (mixed-batch) LoRA routing mask (P2 fork)
 class llm_graph_input_seq_lora_mask : public llm_graph_input_i {
 public:
-    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, int32_t n_adapters)
-        : seq_adapter_map(seq_adapter_map), n_adapters(n_adapters) {}
+    llm_graph_input_seq_lora_mask(const int32_t * seq_adapter_map, int32_t n_adapters, uint32_t n_outputs)
+        : seq_adapter_map(seq_adapter_map), n_adapters(n_adapters), n_outputs(n_outputs) {}
     virtual ~llm_graph_input_seq_lora_mask() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
     ggml_tensor * mask = nullptr; // F32 [n_tokens, n_adapters]; column k = 1.0 where token's seq routes to adapter k
 
+    // same routing over the rows inp_out_ids keeps. A model can narrow the
+    // activations to n_outputs rows inside the layer loop and then run the FFN.
+    // Built only when a node uses it: the allocator backs a tensor no node
+    // consumes with no buffer, and set_input would then write to nothing.
+    ggml_tensor * mask_out = nullptr; // F32 [n_outputs, n_adapters]
+
     const int32_t * seq_adapter_map;
     const int32_t   n_adapters;
+    const uint32_t  n_outputs;
 };
 
 // temperature tuning, used by llama4
@@ -991,7 +998,11 @@ struct llm_graph_context {
     // per-sequence (mixed-batch) LoRA routing (P2 fork)
     const std::vector<llama_adapter_lora *> * seq_loras        = nullptr;
     const int32_t                           * seq_adapter_map  = nullptr;
-    mutable ggml_tensor                     * seq_lora_mask    = nullptr; // F32 [n_tokens, n_adapters], built lazily
+    mutable ggml_tensor                     * seq_lora_mask     = nullptr; // F32 [n_tokens,  n_adapters], built lazily
+    mutable ggml_tensor                     * seq_lora_mask_out = nullptr; // F32 [n_outputs, n_adapters], built lazily
+    // the input object owning both masks; res owns it, this is a borrow so the
+    // reduced mask can be added to it after the fact
+    mutable llm_graph_input_seq_lora_mask   * seq_lora_mask_inp = nullptr;
     // fork hats: per-loop-step LoRA routing; loop_n_phys is set by looped arch
     // graphs (nanbeige) so build_lora_mm can compute loop_step = il / n_phys
     const std::vector<int32_t>              * loop_hat_map     = nullptr;
@@ -1123,7 +1134,8 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
-    ggml_tensor * build_inp_seq_lora_mask() const; // P2 fork: mixed-batch LoRA routing mask
+    // P2 fork: mixed-batch LoRA routing mask, over n_tokens or n_outputs rows
+    ggml_tensor * build_inp_seq_lora_mask(int64_t n_rows) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

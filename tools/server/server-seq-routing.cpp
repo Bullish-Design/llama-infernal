@@ -237,8 +237,8 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
     if (cfg.n_parallel <= 8) {
         out.push_back({ "W-1", string_format(
             "--lora-seq-routing at --parallel %d: the gain is smallest at low concurrency. Measured on mixed "
-            "traffic at pool 2: 1.20x at c=8, 2.73x at c=16, 1.38x at c=32 with 3-pair adapters, and 1.03x, "
-            "1.85x, 1.07x with 154-pair adapters. The win is peaked near c=16, not monotone - it tracks how "
+            "traffic at pool 2: 1.20x at c=8, 2.69x at c=16, 1.38x at c=32 with 3-pair adapters, and 1.02x, "
+            "1.88x, 1.08x with 154-pair adapters. The win is peaked near c=16, not monotone - it tracks how "
             "badly the stock server serializes at that concurrency.",
             cfg.n_parallel) });
     }
@@ -257,11 +257,11 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
         }
         const std::string largest = known ? std::to_string(max_pairs) : std::string("unknown");
         out.push_back({ "W-5", string_format(
-            "--lora-seq-routing: every request pays for all %d registered adapters, not only the one it uses. "
-            "Traffic that names a single adapter is therefore SLOWER than with routing off. Measured at pool 2: "
-            "0.97x-0.99x with 3-pair adapters, 0.71x-0.82x with 154-pair adapters (largest here: %s pairs). "
-            "Turn routing off if your traffic is not adapter-heterogeneous.",
-            (int32_t) cfg.pool.size(), largest.c_str()) });
+            "--lora-seq-routing: routing costs traffic that names a single adapter, because each token carries "
+            "its own mask. Measured against routing off: 0.97x-0.99x with 3-pair adapters and 0.88x-0.92x with "
+            "154-pair ones (largest here: %s pairs). The cost is the mask, not the pool - it does not grow with "
+            "the %d registered adapters. Turn routing off if your traffic is not adapter-heterogeneous.",
+            largest.c_str(), (int32_t) cfg.pool.size()) });
     }
 
     // W-2 [S8, S10, S11-P5]. The pair count is the number that predicts the
@@ -274,9 +274,9 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
         }
         out.push_back({ "W-2", string_format(
             "--lora-seq-routing: pool of %d adapters carrying %s LoRA pairs. The unfused loop costs per "
-            "REGISTERED adapter and scales with pair count. Measured per decode step at full batch width, pool "
-            "2: two 154-pair adapters cost 1.23x at c=8, 1.40x at c=16 and 1.29x at c=32; two 3-pair adapters "
-            "cost 1.01x-1.03x at every one.",
+            "adapter IN FLIGHT and scales with pair count; pool size itself is nearly free. Measured per decode "
+            "step at full batch width: one 154-pair adapter in flight costs 1.08x-1.14x, one 3-pair adapter "
+            "1.01x-1.03x, and going from pool 2 to pool 8 at the same traffic costs 1.01x.",
             (int32_t) cfg.pool.size(), pairs.c_str()) });
     }
 
@@ -288,11 +288,17 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
             "your acceptance rate before keeping this on." });
     }
 
-    // W-4 [S8]
+    // W-4 [S8, and stage 6A]. D3 capped the pool at 3 because the graph was
+    // built over every REGISTERED adapter, so pool 8 cost 1.80x pool 2 whatever
+    // was in flight. The graph is now built over the adapters in flight, and
+    // the same comparison measures 1.01x. The cap is no longer cost-driven, so
+    // this warns about memory rather than about throughput.
     if (cfg.pool.size() > 3) {
         out.push_back({ "W-4", string_format(
-            "--lora-seq-routing: pool of %d exceeds the documented budget of 3 (50%% of single-adapter "
-            "throughput). At pool 8 routing is 1.82x slower per step than the stock serialization it replaces.",
+            "--lora-seq-routing: pool of %d. Registered adapters no longer cost throughput - pool 8 is 1.01x "
+            "pool 2 per decode step at the same traffic - but each one still holds its weights in VRAM and "
+            "widens the graph node budget. Size the pool for memory, and expect no gain from adapters no "
+            "request names.",
             (int32_t) cfg.pool.size()) });
     }
 

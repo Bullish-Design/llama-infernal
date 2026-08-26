@@ -228,13 +228,40 @@ std::vector<seq_routing_finding> seq_routing_refusals(const seq_routing_config &
 std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config & cfg) {
     std::vector<seq_routing_finding> out;
 
-    // W-1 [S6c, S10]
+    // W-1 [S6c, S10, and the envelope sweep in 13-ROUTING-ENVELOPE.md].
+    // The earlier text said "routing pays above 8", which the sweep refutes:
+    // the win is peaked, not monotone. It tracks how badly stock serializes at
+    // that concurrency, and on this rig that is worst at c=16 because the
+    // serialized arm sits at batch width 8, in ggml-cuda's MMVQ regime, while
+    // the routed arm reaches 16 in the cheaper MMQ one.
     if (cfg.n_parallel <= 8) {
         out.push_back({ "W-1", string_format(
-            "--lora-seq-routing at --parallel %d: ggml-cuda selects the MMVQ matmul at batch width <= 8, where "
-            "widening a decode costs 5.80 ms per added sequence. Measured end-to-end at c=8 with 154-pair "
-            "adapters: 0.985x - a wash. Routing pays above 8.",
+            "--lora-seq-routing at --parallel %d: the gain is smallest at low concurrency. Measured on mixed "
+            "traffic at pool 2: 1.20x at c=8, 2.73x at c=16, 1.38x at c=32 with 3-pair adapters, and 1.03x, "
+            "1.85x, 1.07x with 154-pair adapters. The win is peaked near c=16, not monotone - it tracks how "
+            "badly the stock server serializes at that concurrency.",
             cfg.n_parallel) });
+    }
+
+    // W-5 [13-ROUTING-ENVELOPE.md section 4.4]. The graph is built over the
+    // whole registered pool, while the stock path installs only the adapter the
+    // request named and drops the zero-scale ones. So a request using one
+    // adapter still pays for every adapter in the pool, and homogeneous traffic
+    // is slower under routing than without it. Nothing else warns about this.
+    if (cfg.pool.size() > 1) {
+        size_t max_pairs = 0;
+        bool   known     = true;
+        for (const auto & a : cfg.pool) {
+            known = known && a.gguf_ok;
+            max_pairs = std::max(max_pairs, a.n_pairs);
+        }
+        const std::string largest = known ? std::to_string(max_pairs) : std::string("unknown");
+        out.push_back({ "W-5", string_format(
+            "--lora-seq-routing: every request pays for all %d registered adapters, not only the one it uses. "
+            "Traffic that names a single adapter is therefore SLOWER than with routing off. Measured at pool 2: "
+            "0.97x-0.99x with 3-pair adapters, 0.71x-0.82x with 154-pair adapters (largest here: %s pairs). "
+            "Turn routing off if your traffic is not adapter-heterogeneous.",
+            (int32_t) cfg.pool.size(), largest.c_str()) });
     }
 
     // W-2 [S8, S10, S11-P5]. The pair count is the number that predicts the
@@ -247,8 +274,9 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
         }
         out.push_back({ "W-2", string_format(
             "--lora-seq-routing: pool of %d adapters carrying %s LoRA pairs. The unfused loop costs per "
-            "REGISTERED adapter and scales with pair count: two 154-pair adapters cost 1.36x per decode step at "
-            "c=16, two 3-pair adapters cost 1.02x.",
+            "REGISTERED adapter and scales with pair count. Measured per decode step at full batch width, pool "
+            "2: two 154-pair adapters cost 1.23x at c=8, 1.40x at c=16 and 1.29x at c=32; two 3-pair adapters "
+            "cost 1.01x-1.03x at every one.",
             (int32_t) cfg.pool.size(), pairs.c_str()) });
     }
 

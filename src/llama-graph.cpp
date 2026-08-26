@@ -1464,9 +1464,31 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     // its own sequence's adapter. Correctness-first (unfused): compute every pool
     // adapter's delta over all tokens and mask it to the tokens that selected it.
     if (seq_loras != nullptr && !seq_loras->empty()) {
-        if (seq_lora_mask == nullptr) {
-            build_inp_seq_lora_mask();
+        // Nothing to mask when no pooled adapter carries a weight for w, and
+        // the check has to come BEFORE the mask is built. build_lora_mm runs
+        // for every tensor in the model, most of which no adapter targets; a
+        // mask built there is consumed by no node, so the allocator gives it no
+        // buffer and set_input writes to nothing (ggml-backend.cpp:327).
+        bool targeted = false;
+        for (int32_t k = 0; !targeted && k < (int32_t) seq_loras->size(); ++k) {
+            targeted = (*seq_loras)[k]->get_weight(w) != nullptr;
         }
+        if (!targeted) {
+            return res;
+        }
+
+        // A model may narrow the activations to n_outputs rows inside the layer
+        // loop and then run the FFN, so build_lora_mm is reached with either row
+        // count. Ask for the mask that matches the rows in hand; a third row
+        // count is a shape this routing cannot describe, and it fails loudly
+        // rather than masking the wrong tokens.
+        const int64_t n_rows = res->ne[1];
+        if (n_rows != (int64_t) n_tokens && n_rows != (int64_t) n_outputs) {
+            GGML_ABORT("seq LoRA routing: %lld rows match neither n_tokens (%lld) nor n_outputs (%lld)",
+                    (long long) n_rows, (long long) n_tokens, (long long) n_outputs);
+        }
+        ggml_tensor * mask = build_inp_seq_lora_mask(n_rows);
+
         for (int32_t k = 0; k < (int32_t) seq_loras->size(); ++k) {
             llama_adapter_lora * ad = (*seq_loras)[k];
             llama_adapter_lora_weight * lw = ad->get_weight(w);
@@ -1479,11 +1501,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                     ggml_mul_mat(ctx0, lw->a, cur)
                     );
             ab_cur = ggml_scale(ctx0, ab_cur, scale);
-            // per-token membership for adapter k: contiguous column -> [1, n_tokens]
-            ggml_tensor * mcol = ggml_view_1d(ctx0, seq_lora_mask, n_tokens,
-                    (size_t) k * n_tokens * ggml_element_size(seq_lora_mask));
-            mcol = ggml_reshape_2d(ctx0, mcol, 1, n_tokens);
-            ab_cur = ggml_mul(ctx0, ab_cur, mcol); // broadcast [1,n_tokens] over [out,n_tokens]
+            // per-token membership for adapter k: contiguous column -> [1, n_rows]
+            ggml_tensor * mcol = ggml_view_1d(ctx0, mask, n_rows,
+                    (size_t) k * n_rows * ggml_element_size(mask));
+            mcol = ggml_reshape_2d(ctx0, mcol, 1, n_rows);
+            ab_cur = ggml_mul(ctx0, ab_cur, mcol); // broadcast [1,n_rows] over [out,n_rows]
             res = ggml_add(ctx0, res, ab_cur);
         }
         return res;
@@ -2349,7 +2371,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 }
 
 void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
-    if (mask == nullptr) {
+    // Either mask exists only if some node reads it, so either can be absent:
+    // an adapter that targets only tensors after the last layer's inp_out_ids
+    // reduction builds the reduced mask and never the full one.
+    if (mask == nullptr && mask_out == nullptr) {
         return;
     }
     const int64_t n_tokens = ubatch->n_tokens;
@@ -2362,24 +2387,70 @@ void llm_graph_input_seq_lora_mask::set_input(const llama_ubatch * ubatch) {
             data[(size_t) k * n_tokens + t] = 1.0f; // layout [n_tokens, n_adapters]: column k contiguous
         }
     }
-    ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(float));
+    if (mask != nullptr) {
+        ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(float));
+    }
+
+    if (mask_out == nullptr) {
+        return;
+    }
+
+    // The reduced mask keeps exactly the rows inp_out_ids keeps, in the same
+    // order, so a column of it lines up with activations that ggml_get_rows
+    // already narrowed. Selecting here rather than with a graph-side
+    // ggml_get_rows keeps the node count unchanged and needs no access to the
+    // model's inp_out_ids tensor.
+    std::vector<float> data_out((size_t) n_adapters * n_outputs, 0.0f);
+    if ((int64_t) n_outputs == n_tokens) {
+        data_out = data;
+    } else {
+        GGML_ASSERT(ubatch->output);
+        int64_t j = 0;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            if (!ubatch->output[t]) {
+                continue;
+            }
+            GGML_ASSERT(j < (int64_t) n_outputs);
+            for (int32_t k = 0; k < n_adapters; ++k) {
+                data_out[(size_t) k * n_outputs + j] = data[(size_t) k * n_tokens + t];
+            }
+            ++j;
+        }
+        GGML_ASSERT(j == (int64_t) n_outputs);
+    }
+    ggml_backend_tensor_set(mask_out, data_out.data(), 0, data_out.size() * sizeof(float));
 }
 
-ggml_tensor * llm_graph_context::build_inp_seq_lora_mask() const {
-    const int32_t n_adapters = (int32_t) seq_loras->size();
+// Both masks are built on first use, and only the one a caller asks for. The
+// allocator gives no buffer to a tensor no node consumes, and set_input would
+// then write to nothing (ggml-backend.cpp:327). Either can therefore be absent:
+// an adapter that targets only tensors after the last layer's inp_out_ids
+// reduction needs the reduced mask and never the full one, and the reverse is
+// the common case.
+ggml_tensor * llm_graph_context::build_inp_seq_lora_mask(int64_t n_rows) const {
+    if (seq_lora_mask_inp == nullptr) {
+        const int32_t n_adapters = (int32_t) seq_loras->size();
 
-    auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_adapters);
+        auto inp = std::make_unique<llm_graph_input_seq_lora_mask>(seq_adapter_map, n_adapters, n_outputs);
 
-    auto & cur = inp->mask;
+        // borrow before the move; res owns the input for the graph's lifetime
+        seq_lora_mask_inp = inp.get();
 
-    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) n_tokens, n_adapters);
-    ggml_set_input(cur);
+        res->add_input(std::move(inp));
+    }
 
-    res->add_input(std::move(inp));
+    const bool reduced = n_rows != (int64_t) n_tokens;
 
-    seq_lora_mask = cur; // cache for build_lora_mm (mutable member)
+    ggml_tensor *& slot = reduced ? seq_lora_mask_out : seq_lora_mask;
 
-    return cur;
+    if (slot == nullptr) {
+        slot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_rows, seq_lora_mask_inp->n_adapters);
+        ggml_set_input(slot);
+
+        (reduced ? seq_lora_mask_inp->mask_out : seq_lora_mask_inp->mask) = slot;
+    }
+
+    return slot;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

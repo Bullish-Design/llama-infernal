@@ -149,22 +149,32 @@ static const size_t SEQ_ROUTING_VRAM_MARGIN_DEN = 4;   // 1.25x
 // Fire W-4 when fewer than this many further adapters would fit.
 static const int32_t SEQ_ROUTING_VRAM_WARN_HEADROOM = 2;
 
-void seq_routing_device_memory(size_t * free_bytes, size_t * total_bytes) {
-    *free_bytes  = 0;
-    *total_bytes = 0;
+void seq_routing_device_memory(size_t * free_bytes, size_t * total_bytes, int32_t * n_gpu_devices) {
+    *free_bytes     = 0;
+    *total_bytes    = 0;
+    *n_gpu_devices  = 0;
 
-    // The first GPU device. A multi-device split would need the model's own
-    // device list, which llama.h does not expose; this rig runs one card per
-    // server, and W-4 says "could not be computed" rather than guess if that
-    // ever stops being true.
+    ggml_backend_dev_t first = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const auto type = ggml_backend_dev_type(dev);
         if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             continue;
         }
-        ggml_backend_dev_memory(dev, free_bytes, total_bytes);
-        return;
+        if (first == nullptr) {
+            first = dev;
+        }
+        (*n_gpu_devices)++;
+    }
+
+    // One GPU is the only case with a right answer. With two or more the model
+    // may be split over them (--split-mode layer is the default), and the
+    // model's own device list is not on llama.h, so the first device's free
+    // memory would be a figure for a card that holds part of the weights. That
+    // reads as a valid bound and is not one. Refuse instead: both stay 0, and
+    // W-4 falls back to D3's constant and names the split as the reason.
+    if (*n_gpu_devices == 1) {
+        ggml_backend_dev_memory(first, free_bytes, total_bytes);
     }
 }
 
@@ -398,7 +408,9 @@ std::vector<seq_routing_finding> seq_routing_warnings(const seq_routing_config &
             "back to D3's constant of 3. Registered adapters no longer cost throughput - pool 8 is 1.01x "
             "pool 2 per decode step - but each one holds its weights in memory, so size the pool for it.",
             (int32_t) cfg.pool.size(),
-            cfg.vram_free_bytes == 0 ? "no offload device reported free memory" : "an adapter GGUF could not be sized") });
+            cfg.vram_n_gpu > 1     ? "the model may be split over several GPUs, so no one device's free memory is the bound" :
+            cfg.vram_free_bytes == 0 ? "no offload device reported free memory" :
+                                       "an adapter GGUF could not be sized") });
     }
 
     return out;

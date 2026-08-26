@@ -58,10 +58,12 @@ struct seq_routing_config {
     std::string slot_save_path;                  // R-4
     bool        has_draft_model  = false;        // W-3
 
-    // device memory, W-4. Both 0 = unknown (no offload device, or the backend
-    // could not be asked); W-4 then falls back and says so.
+    // device memory, W-4. Both 0 = unknown (no offload device, the backend
+    // could not be asked, or the model may be split over several GPUs); W-4
+    // then falls back and says which of those it was.
     size_t   vram_free_bytes  = 0;
     size_t   vram_total_bytes = 0;
+    int32_t  vram_n_gpu       = 0;   // GPU devices this process can see
 
     std::vector<seq_routing_adapter> pool;
 };
@@ -103,9 +105,12 @@ struct seq_routing_vram_cap {
 
 seq_routing_vram_cap seq_routing_pool_vram_cap(const seq_routing_config & cfg);
 
-// Free and total memory of the first offload device, for W-4. Sets both to 0
-// when there is no such device, which is the CPU-only case and not an error.
-void seq_routing_device_memory(size_t * free_bytes, size_t * total_bytes);
+// Free and total memory of the single offload device, for W-4, and the count of
+// GPU devices this process can see. Sets both sizes to 0 when there is no such
+// device (the CPU-only case, not an error) and when there is more than one: the
+// model may then be split over them and no one device's free memory is the
+// bound. n_gpu_devices carries which case it was.
+void seq_routing_device_memory(size_t * free_bytes, size_t * total_bytes, int32_t * n_gpu_devices);
 
 // R-1 to R-7. An empty result means the server may start.
 std::vector<seq_routing_finding> seq_routing_refusals(const seq_routing_config & cfg);

@@ -1404,7 +1404,7 @@ private:
 
             // W-4's bound. Read AFTER the model and the pool are resident, so
             // "free" is what is left over, not what the device started with.
-            seq_routing_device_memory(&cfg.vram_free_bytes, &cfg.vram_total_bytes);
+            seq_routing_device_memory(&cfg.vram_free_bytes, &cfg.vram_total_bytes, &cfg.vram_n_gpu);
 
             // R-2 probes the library instead of assuming it. A library carrying
             // the stage 0.5 node-budget fix returns -1 for an out-of-range
@@ -1452,6 +1452,15 @@ private:
                     cfg.vram_free_bytes  = 0;
                     cfg.vram_total_bytes = 0;
                 }
+                // The third W-4 state: several GPUs, so the model may be split
+                // and no one device's free memory is the bound. A real split
+                // needs a server started over both cards, which this rig cannot
+                // do while a card is leased to CI.
+                if (f.find("vram_split") != std::string::npos) {
+                    cfg.vram_free_bytes  = 0;
+                    cfg.vram_total_bytes = 0;
+                    cfg.vram_n_gpu       = 2;
+                }
                 SRV_WRN("LLAMA_SEQ_ROUTING_TEST_FORCE = %s\n", force);
             }
             if (const char * scan = getenv("LLAMA_SEQ_ROUTING_TEST_SCAN")) {
@@ -1497,8 +1506,10 @@ private:
                         vram.headroom, vram.cap);
             } else {
                 SRV_INF("--lora-seq-routing: pool of %d adapters registered, library node budget %s, "
-                        "adapter VRAM cost not computable\n",
-                        (int32_t) seq_pool.size(), cfg.node_budget_fixed ? "fixed" : "UNFIXED");
+                        "adapter VRAM cost not computable (%s)\n",
+                        (int32_t) seq_pool.size(), cfg.node_budget_fixed ? "fixed" : "UNFIXED",
+                        cfg.vram_n_gpu > 1 ? "several GPUs visible, the model may be split over them" :
+                        cfg.vram_n_gpu == 0 ? "no offload device" : "an adapter GGUF could not be sized");
             }
         }
 
